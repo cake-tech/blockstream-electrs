@@ -617,7 +617,6 @@ impl Indexer {
             // non-eligible inputs
             outpoints.push((prev_txid.to_string(), prev_vout));
 
-            // WARN: gettransaction_raw with blockhash=None requires bitcoind with txindex=1
             let prev_txo = lookup_txo(&self.store.txstore_db, &txin.previous_output);
             if let Some(prev_txo) = prev_txo {
                 match get_pubkey_from_input(

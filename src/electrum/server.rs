@@ -354,7 +354,7 @@ impl Connection {
 
         let heights = scan_height + count;
         let final_height = if last_height < heights {
-            last_height
+            last_height + 1
         } else {
             heights
         };
@@ -379,39 +379,41 @@ impl Connection {
                 let mut spend = vout.spending_input.clone();
                 let mut has_been_spent = spend.is_some();
 
-                let cached_height_for_tweak = self
-                    .query
-                    .chain()
-                    .get_tweak_cached_height(row_height)
-                    .unwrap_or(0);
-                let query_cached = last_height == cached_height_for_tweak;
-                let should_query = !has_been_spent && !query_cached;
+                if row_height < last_height - 5 {
+                    let cached_height_for_tweak = self
+                        .query
+                        .chain()
+                        .get_tweak_cached_height(row_height)
+                        .unwrap_or(0);
+                    let query_cached = last_height == cached_height_for_tweak;
+                    let should_query = !has_been_spent && !query_cached;
 
-                if should_query {
-                    spend = self.query.lookup_spend(&OutPoint {
-                        txid: txid.clone(),
-                        vout: vout.vout as u32,
-                    });
+                    if should_query {
+                        spend = self.query.lookup_spend(&OutPoint {
+                            txid: txid.clone(),
+                            vout: vout.vout as u32,
+                        });
 
-                    has_been_spent = spend.is_some();
-                    let mut new_tweak = tweak.clone();
-                    new_tweak
-                        .vout_data
-                        .iter_mut()
-                        .find(|v| v.vout == vout.vout)
-                        .unwrap()
-                        .spending_input = spend.clone();
+                        has_been_spent = spend.is_some();
+                        let mut new_tweak = tweak.clone();
+                        new_tweak
+                            .vout_data
+                            .iter_mut()
+                            .find(|v| v.vout == vout.vout)
+                            .unwrap()
+                            .spending_input = spend.clone();
 
-                    let row = TweakTxRow::new(row_height, txid.clone(), &new_tweak);
-                    self.query.chain().store().tweak_db().put(
-                        &bincode::serialize_big(&row.key).unwrap(),
-                        &bincode::serialize_big(&row.value).unwrap(),
-                    );
-                }
+                        let row = TweakTxRow::new(row_height, txid.clone(), &new_tweak);
+                        self.query.chain().store().tweak_db().put(
+                            &bincode::serialize_big(&row.key).unwrap(),
+                            &bincode::serialize_big(&row.value).unwrap(),
+                        );
+                    }
 
-                let skip_this_vout = !historical_mode && has_been_spent;
-                if skip_this_vout {
-                    continue;
+                    let skip_this_vout = !historical_mode && has_been_spent;
+                    if skip_this_vout {
+                        continue;
+                    }
                 }
 
                 if let Some(pubkey) = &vout

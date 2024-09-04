@@ -121,8 +121,8 @@ impl Query {
         self.chain.tweaks_iter_scan_reverse(height)
     }
 
-    pub fn tweaks_iter_scan(&self, height: u32) -> ScanIterator {
-        self.chain.tweaks_iter_scan(height)
+    pub fn tweaks_iter_scan(&self, start_height: u32, final_height: u32) -> ScanIterator {
+        self.chain.tweaks_iter_scan(start_height, final_height)
     }
 
     pub fn stats(&self, scripthash: &[u8]) -> (ScriptStats, ScriptStats) {

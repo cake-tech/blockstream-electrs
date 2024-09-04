@@ -29,7 +29,7 @@ use crate::chain::{
     BlockHash, BlockHeader, Network, OutPoint, Script, Transaction, TxOut, Txid, Value,
 };
 use crate::config::Config;
-use crate::daemon::{tx_from_value, Daemon};
+use crate::daemon::Daemon;
 use crate::errors::*;
 use crate::metrics::{Gauge, HistogramOpts, HistogramTimer, HistogramVec, MetricOpts, Metrics};
 use crate::util::{
@@ -380,7 +380,7 @@ impl Indexer {
                 let count = Arc::new(AtomicUsize::new(0));
 
                 start_fetcher(self.from, &daemon, to_tweak)?
-                    .map(|blocks| self.tweak(&blocks, &daemon, total, &count));
+                    .map(|blocks| self.tweak(&blocks, total, &count));
                 self.start_auto_compactions(&self.store.tweak_db());
             }
         } else {
@@ -523,13 +523,7 @@ impl Indexer {
         self.store.history_db.write(rows, self.flush);
     }
 
-    fn tweak(
-        &self,
-        blocks: &[BlockEntry],
-        daemon: &Daemon,
-        total: usize,
-        count: &Arc<AtomicUsize>,
-    ) {
+    fn tweak(&self, blocks: &[BlockEntry], total: usize, count: &Arc<AtomicUsize>) {
         let rows = {
             let _timer = self.start_timer("tweak_process");
             blocks
@@ -546,7 +540,6 @@ impl Indexer {
                             tx,
                             &mut rows,
                             &mut tweaks,
-                            daemon,
                         );
                     }
 
@@ -579,7 +572,6 @@ impl Indexer {
         tx: &Transaction,
         rows: &mut Vec<DBRow>,
         tweaks: &mut Vec<Vec<u8>>,
-        daemon: &Daemon,
     ) {
         let txid = &tx.txid();
         let mut output_pubkeys: Vec<VoutData> = Vec::with_capacity(tx.output.len());
@@ -626,21 +618,16 @@ impl Indexer {
             outpoints.push((prev_txid.to_string(), prev_vout));
 
             // WARN: gettransaction_raw with blockhash=None requires bitcoind with txindex=1
-            let prev_tx_result = daemon.gettransaction_raw(&prev_txid, None, true);
-            if let Ok(prev_tx_value) = prev_tx_result {
-                if let Some(prev_tx) = tx_from_value(prev_tx_value.get("hex").unwrap().clone()).ok()
-                {
-                    if let Some(prevout) = prev_tx.output.get(prev_vout as usize) {
-                        match get_pubkey_from_input(
-                            &txin.script_sig.to_bytes(),
-                            &(txin.witness.clone() as Witness).to_vec(),
-                            &prevout.script_pubkey.to_bytes(),
-                        ) {
-                            Ok(Some(pubkey)) => pubkeys.push(pubkey),
-                            Ok(None) => (),
-                            Err(_e) => {}
-                        }
-                    }
+            let prev_txo = lookup_txo(&self.store.txstore_db, &txin.previous_output);
+            if let Some(prev_txo) = prev_txo {
+                match get_pubkey_from_input(
+                    &txin.script_sig.to_bytes(),
+                    &(txin.witness.clone() as Witness).to_vec(),
+                    &prev_txo.script_pubkey.to_bytes(),
+                ) {
+                    Ok(Some(pubkey)) => pubkeys.push(pubkey),
+                    Ok(None) => (),
+                    Err(_e) => {}
                 }
             }
         }
@@ -893,14 +880,15 @@ impl ChainQuery {
     pub fn tweaks_iter_scan_reverse(&self, height: u32) -> ReverseScanIterator {
         self.store.tweak_db.iter_scan_reverse(
             &TweakTxRow::filter(),
-            &TweakTxRow::prefix_blockheight(TweakTxRow::code(), height),
+            &TweakTxRow::prefix_blockheight(height),
         )
     }
 
-    pub fn tweaks_iter_scan(&self, height: u32) -> ScanIterator {
-        self.store.tweak_db.iter_scan_from(
+    pub fn tweaks_iter_scan(&self, start_height: u32, end_height: u32) -> ScanIterator {
+        self.store.tweak_db.iter_scan_range(
             &TweakTxRow::filter(),
-            &TweakTxRow::prefix_blockheight(TweakTxRow::code(), height),
+            &TweakTxRow::prefix_blockheight(start_height),
+            &TweakTxRow::prefix_blockheight(end_height),
         )
     }
 
@@ -1549,8 +1537,8 @@ impl TweakTxRow {
         [TweakTxRow::code()].to_vec()
     }
 
-    fn prefix_blockheight(code: u8, height: u32) -> Bytes {
-        bincode::serialize_big(&(code, height)).unwrap()
+    fn prefix_blockheight(height: u32) -> Bytes {
+        bincode::serialize_big(&(TweakTxRow::code(), height)).unwrap()
     }
 
     pub fn get_tweak_data(&self) -> TweakData {

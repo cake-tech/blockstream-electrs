@@ -333,12 +333,9 @@ impl Connection {
         let mut height: u32 = usize_from_value(params.get(0), "height")?
             .try_into()
             .unwrap();
-        let mut count: u32 = usize_from_value(params.get(1), "count")?
+        let count: u32 = usize_from_value(params.get(1), "count")?
             .try_into()
             .unwrap();
-        if count > 25 {
-            count = 25;
-        }
         let historical_mode =
             bool_from_value_or(params.get(2), "historical", false).unwrap_or(false);
 
@@ -365,13 +362,10 @@ impl Connection {
         let mut tweak_map = HashMap::new();
         let mut prev_height = scan_height;
 
-        let tweaked_blockhashes = self.query.chain().store().tweaked_blockhashes().len() as u32;
-        let should_reverse = scan_height > tweaked_blockhashes / 2;
-        let rows: Vec<_> = if should_reverse {
-            self.query.tweaks_iter_scan_reverse(scan_height).collect()
-        } else {
-            self.query.tweaks_iter_scan(scan_height).collect()
-        };
+        let rows: Vec<_> = self
+            .query
+            .tweaks_iter_scan(scan_height, final_height)
+            .collect();
 
         for row in rows {
             let tweak_row = TweakTxRow::from_row(row);

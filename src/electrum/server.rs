@@ -341,9 +341,9 @@ impl Connection {
 
         let sp_begin_height = self.query.sp_begin_height();
         let last_header_entry = self.query.chain().best_header();
-        let last_height = last_header_entry.height().try_into().unwrap();
+        let last_blockchain_height = last_header_entry.height().try_into().unwrap();
         if height == 0 {
-            height = last_height;
+            height = last_blockchain_height;
         }
 
         let scan_height = if height < sp_begin_height {
@@ -353,8 +353,8 @@ impl Connection {
         };
 
         let heights = scan_height + count;
-        let final_height = if last_height < heights {
-            last_height + 1
+        let final_scanned_height = if last_blockchain_height <= heights {
+            last_blockchain_height + 1
         } else {
             heights
         };
@@ -364,12 +364,19 @@ impl Connection {
 
         let rows: Vec<_> = self
             .query
-            .tweaks_iter_scan(scan_height, final_height)
+            .tweaks_iter_scan(scan_height, final_scanned_height)
             .collect();
 
         for row in rows {
             let tweak_row = TweakTxRow::from_row(row);
             let row_height = tweak_row.key.blockheight;
+            let is_new_block = row_height != prev_height;
+
+            if is_new_block {
+                let _ = self.send_values(&[json!({"jsonrpc":"2.0","method":"blockchain.tweaks.subscribe","params":[{ prev_height.to_string(): tweak_map }]})]);
+                prev_height = row_height;
+                tweak_map = HashMap::new();
+            }
 
             let txid = tweak_row.key.txid;
             let tweak = tweak_row.get_tweak_data();
@@ -379,13 +386,13 @@ impl Connection {
                 let mut spend = vout.spending_input.clone();
                 let mut has_been_spent = spend.is_some();
 
-                if row_height < last_height - 5 {
+                if row_height < last_blockchain_height - 5 {
                     let cached_height_for_tweak = self
                         .query
                         .chain()
                         .get_tweak_cached_height(row_height)
                         .unwrap_or(0);
-                    let query_cached = last_height == cached_height_for_tweak;
+                    let query_cached = last_blockchain_height == cached_height_for_tweak;
                     let should_query = !has_been_spent && !query_cached;
 
                     if should_query {
@@ -408,6 +415,12 @@ impl Connection {
                             &bincode::serialize_big(&row.key).unwrap(),
                             &bincode::serialize_big(&row.value).unwrap(),
                         );
+
+                        if is_new_block {
+                            self.query
+                                .chain()
+                                .store_tweak_cache_height(row_height, last_blockchain_height);
+                        }
                     }
 
                     let skip_this_vout = !historical_mode && has_been_spent;
@@ -445,20 +458,11 @@ impl Connection {
                     }),
                 );
             }
-
-            if row_height != prev_height {
-                let _ = self.send_values(&[json!({"jsonrpc":"2.0","method":"blockchain.tweaks.subscribe","params":[{ prev_height.to_string(): tweak_map }]})]);
-                self.query
-                    .chain()
-                    .store_tweak_cache_height(row_height, last_height);
-                prev_height = row_height;
-                tweak_map = HashMap::new();
-            }
-
-            if prev_height >= final_height.try_into().unwrap() {
-                break;
-            }
         }
+
+        let _ = self.send_values(
+            &[json!({"jsonrpc":"2.0","method":"blockchain.tweaks.subscribe","params":[{ (final_scanned_height - 1).to_string(): tweak_map }]})]
+        );
 
         let done = json!({"jsonrpc":"2.0","method":"blockchain.tweaks.subscribe","params":[{"message": "done"}]});
         self.send_values(&[done.clone()])?;

@@ -330,7 +330,7 @@ impl Connection {
     // Progressively receive block tweak data per height iteration
     // Client is expected to actively listen for messages until "done"
     pub fn tweaks_subscribe(&mut self, params: &[Value]) -> Result<Value> {
-        let mut height: u32 = usize_from_value(params.get(0), "height")?
+        let height: u32 = usize_from_value(params.get(0), "height")?
             .try_into()
             .unwrap();
         let count: u32 = usize_from_value(params.get(1), "count")?
@@ -342,9 +342,6 @@ impl Connection {
         let sp_begin_height = self.query.sp_begin_height();
         let last_header_entry = self.query.chain().best_header();
         let last_blockchain_height = last_header_entry.height().try_into().unwrap();
-        if height == 0 {
-            height = last_blockchain_height;
-        }
 
         let scan_height = if height < sp_begin_height {
             sp_begin_height

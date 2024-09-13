@@ -333,9 +333,14 @@ impl Connection {
         let height: u32 = usize_from_value(params.get(0), "height")?
             .try_into()
             .unwrap();
-        let count: u32 = usize_from_value(params.get(1), "count")?
+
+        let mut count: u32 = usize_from_value(params.get(1), "count")?
             .try_into()
             .unwrap();
+        if count > 1000 {
+            count = 1000;
+        }
+
         let historical_mode =
             bool_from_value_or(params.get(2), "historical", false).unwrap_or(false);
 

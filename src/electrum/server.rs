@@ -373,11 +373,21 @@ impl Connection {
             let tweak_row = TweakTxRow::from_row(row);
             let row_height = tweak_row.key.blockheight;
             let is_new_block = row_height != prev_height;
+            let mut query_for_height_cached = None;
 
             if is_new_block {
                 let _ = self.send_values(&[json!({"jsonrpc":"2.0","method":"blockchain.tweaks.subscribe","params":[{ prev_height.to_string(): tweak_map }]})]);
                 prev_height = row_height;
                 tweak_map = HashMap::new();
+            }
+
+            if row_height < last_blockchain_height - 5 {
+                let cached_height_for_tweak = self
+                    .query
+                    .chain()
+                    .get_tweak_cached_height(row_height)
+                    .unwrap_or(0);
+                query_for_height_cached = Some(last_blockchain_height == cached_height_for_tweak);
             }
 
             let txid = tweak_row.key.txid;
@@ -388,13 +398,7 @@ impl Connection {
                 let mut spend = vout.spending_input.clone();
                 let mut has_been_spent = spend.is_some();
 
-                if row_height < last_blockchain_height - 5 {
-                    let cached_height_for_tweak = self
-                        .query
-                        .chain()
-                        .get_tweak_cached_height(row_height)
-                        .unwrap_or(0);
-                    let query_cached = last_blockchain_height == cached_height_for_tweak;
+                if let Some(query_cached) = query_for_height_cached {
                     let should_query = !has_been_spent && !query_cached;
 
                     if should_query {

@@ -319,6 +319,9 @@ impl Connection {
             .map(|v| v.as_u64())
             .flatten();
 
+        // Parse optional exclude_spent parameter
+        let filter_spent: bool = bool_from_value_or(params.get(2), "filter_spent", false)?;
+
         let sp_begin_height = self.query.sp_begin_height();
         // let last_header_entry = self.query.chain().best_header();
 
@@ -328,7 +331,7 @@ impl Connection {
             height
         };
 
-        let tweaks = self.query.block_tweaks_with_dust_limit(scan_height, dust_limit)?;
+        let tweaks = self.query.block_tweaks_with_filters(scan_height, dust_limit, filter_spent)?;
         Ok(json!(tweaks))
     }
 

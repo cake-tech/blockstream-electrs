@@ -117,6 +117,13 @@ impl Query {
             .get_block_tweaks(&self.chain.hash_by_height(height as usize).unwrap())
     }
 
+    pub fn block_tweaks_with_dust_limit(&self, height: u32, dust_limit: Option<u64>) -> Result<Vec<String>> {
+        let block_hash = self.chain
+            .hash_by_height(height as usize)
+            .chain_err(|| format!("block not found at height {}", height))?;
+        Ok(self.chain.get_block_tweaks_with_dust_limit(&block_hash, dust_limit))
+    }
+
     pub fn tweaks_iter_scan_reverse(&self, height: u32) -> ReverseScanIterator {
         self.chain.tweaks_iter_scan_reverse(height)
     }

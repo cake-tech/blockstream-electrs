@@ -581,7 +581,7 @@ impl Indexer {
                 let amount = (txo.value as Amount).to_sat();
                 #[allow(deprecated)]
                 if txo.script_pubkey.is_v1_p2tr()
-                    && amount >= self.iconfig.sp_min_dust.unwrap_or(1_000) as u64
+                    && amount >= self.iconfig.sp_min_dust.unwrap_or(0) as u64
                 {
                     output_pubkeys.push(VoutData {
                         vout: txo_index,
@@ -634,19 +634,39 @@ impl Indexer {
         let pubkeys_ref: Vec<_> = pubkeys.iter().collect();
         if !pubkeys_ref.is_empty() {
             if let Some(tweak) = calculate_tweak_data(&pubkeys_ref, &outpoints).ok() {
-                // persist tweak index:
-                //      K{blockhash}{txid} → {tweak}{serialized-vout-data}
+                let tweak_hex = tweak.serialize().to_lower_hex_string();
+                
+                // persist detailed tweak index:
+                //      K{blockheight}{txid} → {tweak}{serialized-vout-data}
                 rows.push(
                     TweakTxRow::new(
                         blockheight,
                         txid.clone(),
                         &TweakData {
-                            tweak: tweak.serialize().to_lower_hex_string(),
+                            tweak: tweak_hex.clone(),
                             vout_data: output_pubkeys.clone(),
                         },
                     )
                     .into_row(),
                 );
+
+                // Calculate max output amount for efficient dust filtering
+                // let max_output_amount = output_pubkeys.iter()
+                //     .map(|vout| vout.amount)
+                //     .max()
+                //     .unwrap_or(0);
+                // // persist summary tweak index for efficient dust filtering:
+                // //      S{blockheight}{txid} → {tweak}{max_output_amount}
+                // rows.push(
+                //     TweakSummaryRow::new(
+                //         blockheight,
+                //         txid.clone(),
+                //         tweak_hex,
+                //         max_output_amount,
+                //     )
+                //     .into_row(),
+                // );
+
                 tweaks.push(tweak.serialize().to_vec());
             }
         }
@@ -1137,19 +1157,51 @@ impl ChainQuery {
     }
 
     pub fn get_block_tweaks(&self, hash: &BlockHash) -> Vec<String> {
+        self.get_block_tweaks_with_dust_limit(hash, None)
+    }
+
+    pub fn get_block_tweaks_with_dust_limit(&self, hash: &BlockHash, min_dust: Option<u64>) -> Vec<String> {
         let _timer = self.start_timer("get_block_tweaks");
 
-        let tweaks: Vec<Vec<u8>> = self
-            .store
-            .tweak_db
-            .get(&BlockRow::tweaks_key(full_hash(&hash[..])))
-            .map(|val| bincode::deserialize_little(&val).expect("failed to parse block tweaks"))
-            .unwrap();
+        // If no dust limit specified, use the fast path (existing behavior)
+        if min_dust.is_none() || min_dust == Some(0) {
+            let tweaks: Vec<Vec<u8>> = self
+                .store
+                .tweak_db
+                .get(&BlockRow::tweaks_key(full_hash(&hash[..])))
+                .map(|val| bincode::deserialize_little(&val).expect("failed to parse block tweaks"))
+                .unwrap_or_default();
 
-        tweaks
-            .into_iter()
-            .map(|tweak| tweak.to_lower_hex_string())
-            .collect()
+            return tweaks
+                .into_iter()
+                .map(|tweak| tweak.to_lower_hex_string())
+                .collect();
+        }
+
+        // Dust filtering path: use lightweight summary rows for efficient filtering
+        let block_height = self.height_by_hash(hash);
+        if block_height.is_none() {
+            return vec![];
+        }
+        let block_height = block_height.unwrap() as u32;
+
+        let min_dust_value = min_dust.unwrap();
+        let mut filtered_tweaks = Vec::new();
+
+        // Use prefix scan to only read TweakTxRow entries for this specific block height
+        let prefix = TweakTxRow::prefix_blockheight(block_height);  // [b'K', height_bytes]
+        let tweak_iter = self.store.tweak_db.iter_scan(&prefix)     // Only scan K{height}* entries
+            .map(TweakTxRow::from_row)
+            .take_while(|row| row.key.blockheight == block_height);
+
+        for tweak_row in tweak_iter {
+            let tweak_data = tweak_row.get_tweak_data();
+            if tweak_data.vout_data.iter().any(|vout| vout.amount >= min_dust_value) {
+                filtered_tweaks.push(tweak_data.tweak);
+            }
+        }
+
+        filtered_tweaks
     }
 
     pub fn hash_by_height(&self, height: usize) -> Option<BlockHash> {

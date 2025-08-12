@@ -314,6 +314,11 @@ impl Connection {
         // let _historical_mode =
         //     bool_from_value_or(params.get(2), "historical", false).unwrap_or(false);
 
+        // Parse optional dust_limit parameter
+        let dust_limit: Option<u64> = params.get(1)
+            .map(|v| v.as_u64())
+            .flatten();
+
         let sp_begin_height = self.query.sp_begin_height();
         // let last_header_entry = self.query.chain().best_header();
 
@@ -323,7 +328,7 @@ impl Connection {
             height
         };
 
-        let tweaks = self.query.block_tweaks(scan_height);
+        let tweaks = self.query.block_tweaks_with_dust_limit(scan_height, dust_limit)?;
         Ok(json!(tweaks))
     }
 
@@ -607,7 +612,7 @@ impl Connection {
         let result = match method {
             "blockchain.block.header" => self.blockchain_block_header(&params),
             "blockchain.block.headers" => self.blockchain_block_headers(&params),
-            "blockchain.block.tweaks" => self.blockchain_block_tweaks(params),
+            "blockchain.block.tweaks" => self.blockchain_block_tweaks(&params),
             "blockchain.tweaks.subscribe" => self.tweaks_subscribe(params),
             // "blockchain.tweaks.register" => self.tweaks_subscribe(params),
             // "blockchain.tweaks.erase" => self.tweaks_subscribe(params),

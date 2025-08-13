@@ -581,7 +581,7 @@ impl Indexer {
                 let amount = (txo.value as Amount).to_sat();
                 #[allow(deprecated)]
                 if txo.script_pubkey.is_v1_p2tr()
-                    && amount >= self.iconfig.sp_min_dust.unwrap_or(1_000) as u64
+                    && amount >= self.iconfig.sp_min_dust.unwrap_or(0) as u64
                 {
                     output_pubkeys.push(VoutData {
                         vout: txo_index,
@@ -634,8 +634,8 @@ impl Indexer {
         let pubkeys_ref: Vec<_> = pubkeys.iter().collect();
         if !pubkeys_ref.is_empty() {
             if let Some(tweak) = calculate_tweak_data(&pubkeys_ref, &outpoints).ok() {
-                // persist tweak index:
-                //      K{blockhash}{txid} → {tweak}{serialized-vout-data}
+                // persist detailed tweak index:
+                //      K{blockheight}{txid} → {tweak}{serialized-vout-data}
                 rows.push(
                     TweakTxRow::new(
                         blockheight,
@@ -647,6 +647,7 @@ impl Indexer {
                     )
                     .into_row(),
                 );
+
                 tweaks.push(tweak.serialize().to_vec());
             }
         }
@@ -1137,8 +1138,64 @@ impl ChainQuery {
     }
 
     pub fn get_block_tweaks(&self, hash: &BlockHash) -> Vec<String> {
+        self.get_block_tweaks_with_filters(hash, None, false)
+    }
+
+    pub fn get_block_tweaks_with_filters(&self, hash: &BlockHash, min_dust: Option<u64>, filter_spent: bool) -> Vec<String> {
         let _timer = self.start_timer("get_block_tweaks");
 
+        // If no filtering needed, use the fast path (existing behavior)
+        if (min_dust.is_none() || min_dust == Some(0)) && !filter_spent {
+            return self.get_block_tweaks_fast_path(hash);
+        }
+
+        // Filtering path: scan TweakTxRow entries for this block
+        let block_height = self.height_by_hash(hash);
+        if block_height.is_none() {
+            return vec![];
+        }
+        let block_height = block_height.unwrap() as u32;
+
+        let mut filtered_tweaks = Vec::new();
+        let prefix = TweakTxRow::prefix_blockheight(block_height);
+        let tweak_iter = self.store.tweak_db.iter_scan(&prefix)
+            .map(TweakTxRow::from_row)
+            .take_while(|row| row.key.blockheight == block_height);
+
+        for tweak_row in tweak_iter {
+            let tweak_data = tweak_row.get_tweak_data();
+            
+            // Apply dust filter if specified
+            if let Some(min_dust_value) = min_dust {
+                if !tweak_data.vout_data.iter().any(|vout| vout.amount >= min_dust_value) {
+                    continue; // Skip this tweak - no outputs above dust limit
+                }
+            }
+            
+            // Apply spent filter if specified
+            if filter_spent {
+                let has_unspent_output = tweak_data.vout_data.iter().any(|vout| {
+                    let outpoint = OutPoint {
+                        txid: tweak_row.key.txid,
+                        vout: vout.vout as u32,
+                    };
+                    // On-demand spend lookup - if lookup_spend returns None, the output is unspent
+                    self.lookup_spend(&outpoint).is_none()
+                });
+                
+                if !has_unspent_output {
+                    continue; // Skip this tweak - all outputs are spent
+                }
+            }
+            
+            filtered_tweaks.push(tweak_data.tweak);
+        }
+
+        filtered_tweaks
+    }
+
+    // Fast path for backward compatibility
+    fn get_block_tweaks_fast_path(&self, hash: &BlockHash) -> Vec<String> {
         let tweaks: Vec<Vec<u8>> = self
             .store
             .tweak_db

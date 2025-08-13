@@ -314,6 +314,14 @@ impl Connection {
         // let _historical_mode =
         //     bool_from_value_or(params.get(2), "historical", false).unwrap_or(false);
 
+        // Parse optional dust_limit parameter
+        let dust_limit: Option<u64> = params.get(1)
+            .map(|v| v.as_u64())
+            .flatten();
+
+        // Parse optional exclude_spent parameter
+        let filter_spent: bool = bool_from_value_or(params.get(2), "filter_spent", false)?;
+
         let sp_begin_height = self.query.sp_begin_height();
         // let last_header_entry = self.query.chain().best_header();
 
@@ -323,7 +331,7 @@ impl Connection {
             height
         };
 
-        let tweaks = self.query.block_tweaks(scan_height);
+        let tweaks = self.query.block_tweaks_with_filters(scan_height, dust_limit, filter_spent)?;
         Ok(json!(tweaks))
     }
 

@@ -634,8 +634,6 @@ impl Indexer {
         let pubkeys_ref: Vec<_> = pubkeys.iter().collect();
         if !pubkeys_ref.is_empty() {
             if let Some(tweak) = calculate_tweak_data(&pubkeys_ref, &outpoints).ok() {
-                let tweak_hex = tweak.serialize().to_lower_hex_string();
-                
                 // persist detailed tweak index:
                 //      K{blockheight}{txid} → {tweak}{serialized-vout-data}
                 rows.push(
@@ -643,29 +641,12 @@ impl Indexer {
                         blockheight,
                         txid.clone(),
                         &TweakData {
-                            tweak: tweak_hex.clone(),
+                            tweak: tweak.serialize().to_lower_hex_string(),
                             vout_data: output_pubkeys.clone(),
                         },
                     )
                     .into_row(),
                 );
-
-                // Calculate max output amount for efficient dust filtering
-                // let max_output_amount = output_pubkeys.iter()
-                //     .map(|vout| vout.amount)
-                //     .max()
-                //     .unwrap_or(0);
-                // // persist summary tweak index for efficient dust filtering:
-                // //      S{blockheight}{txid} → {tweak}{max_output_amount}
-                // rows.push(
-                //     TweakSummaryRow::new(
-                //         blockheight,
-                //         txid.clone(),
-                //         tweak_hex,
-                //         max_output_amount,
-                //     )
-                //     .into_row(),
-                // );
 
                 tweaks.push(tweak.serialize().to_vec());
             }

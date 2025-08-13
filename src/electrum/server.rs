@@ -615,7 +615,7 @@ impl Connection {
         let result = match method {
             "blockchain.block.header" => self.blockchain_block_header(&params),
             "blockchain.block.headers" => self.blockchain_block_headers(&params),
-            "blockchain.block.tweaks" => self.blockchain_block_tweaks(&params),
+            "blockchain.block.tweaks" => self.blockchain_block_tweaks(params),
             "blockchain.tweaks.subscribe" => self.tweaks_subscribe(params),
             // "blockchain.tweaks.register" => self.tweaks_subscribe(params),
             // "blockchain.tweaks.erase" => self.tweaks_subscribe(params),

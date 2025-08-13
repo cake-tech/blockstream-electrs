@@ -1201,9 +1201,12 @@ impl ChainQuery {
             .tweak_db
             .get(&BlockRow::tweaks_key(full_hash(&hash[..])))
             .map(|val| bincode::deserialize_little(&val).expect("failed to parse block tweaks"))
-            .unwrap_or_default();
+            .unwrap();
 
-        tweaks.into_iter().map(|tweak| tweak.to_lower_hex_string()).collect()
+        tweaks
+            .into_iter()
+            .map(|tweak| tweak.to_lower_hex_string())
+            .collect()
     }
 
     pub fn hash_by_height(&self, height: usize) -> Option<BlockHash> {

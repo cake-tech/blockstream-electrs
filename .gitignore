@@ -6,3 +6,12 @@ target
 *.pyc
 result
 .direnv
+
+# Deployment files
+nginx/ssl/*.pem
+nginx/ssl/*.key
+nginx/logs/*
+logs/*
+bitcoin-data/
+bitcoin-blocks/
+.env

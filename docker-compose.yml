@@ -1,0 +1,71 @@
+version: '3.8'
+
+services:
+  electrs:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: electrs
+    restart: unless-stopped
+    networks:
+      - electrs-network
+    volumes:
+      - ./db:/data/db
+      - ./logs:/data/logs
+      - ./bitcoin-data:/bitcoin:ro
+      - ./bitcoin-blocks:/bitcoin-blocks:ro
+    environment:
+      - RUST_BACKTRACE=1
+      - RUST_LOG=info
+    command:
+      - "--network=mainnet"
+      - "--db-dir=/data/db"
+      - "--daemon-dir=/bitcoin"
+      - "--blocks-dir=/bitcoin-blocks"
+      - "--daemon-rpc-addr=172.17.0.1:8332"
+      - "--http-addr=0.0.0.0:3000"
+      - "--electrum-rpc-addr=0.0.0.0:50001"
+      - "--monitoring-addr=0.0.0.0:4224"
+      - "--daemon-parallelism=4"
+      - "--db-block-cache-mb=1024"
+      - "--db-parallelism=8"
+      - "--db-write-buffer-size-mb=256"
+      - "-vvv"
+      - "--timestamp"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/blocks/tip/height"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 300s
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  nginx:
+    image: nginx:alpine
+    container_name: electrs-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    networks:
+      - electrs-network
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - ./nginx/logs:/var/log/nginx
+    depends_on:
+      - electrs
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+networks:
+  electrs-network:
+    driver: bridge
+    name: electrs-network
+
+

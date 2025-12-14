@@ -1,0 +1,51 @@
+name: Deploy (Simple - Git Pull Method)
+
+on:
+  push:
+    branches:
+      - new-SP-electrs
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy to Server
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_PORT || 22 }}
+          script: |
+            set -e
+            echo "=== Deploying Electrs ==="
+            
+            # Navigate to deployment directory
+            cd ${{ secrets.DEPLOY_PATH || '/opt/electrs' }}
+            
+            # Pull latest code
+            echo "Pulling latest code..."
+            git fetch origin
+            git checkout ${{ github.ref_name }}
+            git pull origin ${{ github.ref_name }}
+            
+            # Rebuild and restart containers
+            echo "Rebuilding Docker image..."
+            docker-compose build electrs
+            
+            echo "Restarting services..."
+            docker-compose up -d
+            
+            # Wait for services
+            sleep 10
+            
+            # Verify
+            echo "=== Deployment Status ==="
+            docker-compose ps
+            curl -f http://localhost/health || echo "Health check failed"
+            
+            echo "=== Deployment Complete ==="
+

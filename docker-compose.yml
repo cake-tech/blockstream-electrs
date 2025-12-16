@@ -12,8 +12,8 @@ services:
     volumes:
       - ./db:/data/db
       - ./logs:/data/logs
-      - ./bitcoin-data:/bitcoin:ro
-      - ./bitcoin-blocks:/bitcoin-blocks:ro
+      - /opt/electrs/db/bitcoin-data:/bitcoin:ro
+      - /opt/electrs/db/bitcoin-blocks:/bitcoin-blocks:ro
     environment:
       - RUST_BACKTRACE=1
       - RUST_LOG=info
@@ -30,6 +30,7 @@ services:
       - "--db-block-cache-mb=1024"
       - "--db-parallelism=8"
       - "--db-write-buffer-size-mb=256"
+      - "--jsonrpc-import"
       - "-vvv"
       - "--timestamp"
     healthcheck:

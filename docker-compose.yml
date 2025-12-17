@@ -41,6 +41,10 @@ services:
       start_period: 300s
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    ulimits:
+      nofile:
+        soft: 100000
+        hard: 100000
 
   nginx:
     image: nginx:alpine

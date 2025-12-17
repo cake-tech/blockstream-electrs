@@ -23,6 +23,7 @@ services:
       - "--daemon-dir=/bitcoin"
       - "--blocks-dir=/bitcoin-blocks"
       - "--daemon-rpc-addr=172.18.0.1:8332"
+      - "--cookie=bitcoinrpc:PLACEHOLDER_PASSWORD"
       - "--http-addr=0.0.0.0:3000"
       - "--electrum-rpc-addr=0.0.0.0:50001"
       - "--monitoring-addr=0.0.0.0:4224"

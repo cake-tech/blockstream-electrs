@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   electrs:
     build:
@@ -27,7 +25,7 @@ services:
       - "--http-addr=0.0.0.0:3000"
       - "--electrum-rpc-addr=0.0.0.0:50001"
       - "--monitoring-addr=0.0.0.0:4224"
-      - "--daemon-parallelism=4"
+      - "--daemon-parallelism=2"
       - "--db-block-cache-mb=1024"
       - "--db-parallelism=8"
       - "--db-write-buffer-size-mb=256"

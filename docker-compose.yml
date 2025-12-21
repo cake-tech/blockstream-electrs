@@ -22,7 +22,7 @@ services:
       - "--blocks-dir=/bitcoin-blocks"
       # Verify gateway IP with: docker network inspect electrs-network | grep Gateway
       - "--daemon-rpc-addr=172.18.0.1:8332"
-      - "--cookie=bitcoinrpc:PLACEHOLDER_PASSWORD"
+      - "--cookie=bitcoinrpc:cab44cb7d0ee18fe1c556ae50bae373c8ea81212179c09cfbdee9425dfcbd516"
       - "--http-addr=0.0.0.0:3000"
       - "--electrum-rpc-addr=0.0.0.0:50001"
       - "--monitoring-addr=0.0.0.0:4224"

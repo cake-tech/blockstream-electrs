@@ -20,6 +20,7 @@ services:
       - "--db-dir=/data/db"
       - "--daemon-dir=/bitcoin"
       - "--blocks-dir=/bitcoin-blocks"
+      # Verify gateway IP with: docker network inspect electrs-network | grep Gateway
       - "--daemon-rpc-addr=172.18.0.1:8332"
       - "--cookie=bitcoinrpc:PLACEHOLDER_PASSWORD"
       - "--http-addr=0.0.0.0:3000"
@@ -33,17 +34,20 @@ services:
       - "-vvv"
       - "--timestamp"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/api/blocks/tip/height"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 300s
+      test: ["CMD", "curl", "-f", "--max-time", "30", "http://localhost:3000/api/blocks/tip/height"]
+      interval: 60s
+      timeout: 30s
+      retries: 5
+      start_period: 600s
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ulimits:
       nofile:
         soft: 100000
         hard: 100000
+    # Optional: Add memory limit to prevent OOM issues
+    # mem_limit: 16g
+    # mem_reservation: 8g
 
   nginx:
     image: nginx:alpine

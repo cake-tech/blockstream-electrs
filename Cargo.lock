@@ -251,9 +251,25 @@ checksum = "cf9ff0bbfd639f15c74af777d81383cf53efb7c93613f6cab67c6c11e05bbf8b"
 
 [[package]]
 name = "bech32"
+<<<<<<< HEAD
 version = "0.11.0"
+=======
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d86b93f97252c47b41663388e6d155714a9d0c398b99f1005cbc5f978b29f445"
+
+[[package]]
+name = "bech32"
+version = "0.10.0-beta"
+>>>>>>> cake-update-v1
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d965446196e3b7decd44aa7ee49e31d630118f90ef12f97900f262eb915c951d"
+
+[[package]]
+name = "bimap"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "230c5f1ca6a325a32553f8640d31ac9b49f2411e901e427570154868b46da4f7"
 
 [[package]]
 name = "bincode"
@@ -927,6 +943,7 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "signal-hook",
+ "silentpayments",
  "socket2",
  "stderrlog",
  "sysconf",
@@ -2482,9 +2499,15 @@ dependencies = [
 
 [[package]]
 name = "regex"
+<<<<<<< HEAD
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b544ef1b4eac5dc2db33ea63606ae9ffcfac26c1416a2806ae0bf5f56b201191"
+=======
+version = "1.10.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b91213439dad192326a0d7c6ee3955910425f441d7038e0d6933b0aec5c4517f"
+>>>>>>> cake-update-v1
 dependencies = [
  "aho-corasick",
  "memchr",
@@ -2948,6 +2971,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a9e9e0b4211b72e7b8b6e85c807d36c212bdb33ea8587f7569562a84df5465b1"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "silentpayments"
+version = "0.3.0"
+source = "git+https://github.com/cygnet3/rust-silentpayments?branch=master#48e2730dcb7a1ff9d74bbde569df3649416eb459"
+dependencies = [
+ "bech32 0.9.1",
+ "bimap",
+ "bitcoin_hashes 0.13.0",
+ "hex",
+ "secp256k1 0.28.2",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

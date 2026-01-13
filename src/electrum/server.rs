@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::convert::TryInto;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
@@ -19,14 +20,19 @@ use electrs_macros::trace;
 use bitcoin::consensus::encode::serialize_hex;
 #[cfg(feature = "liquid")]
 use elements::encode::serialize_hex;
-use crate::chain::Txid;
+
+use crate::chain::{OutPoint, Txid};
 use crate::config::{Config, RpcLogging};
 use crate::electrum::{get_electrum_height, ProtocolVersion};
 use crate::errors::*;
 use crate::metrics::{Gauge, HistogramOpts, HistogramVec, MetricOpts, Metrics};
+use crate::new_index::schema::TweakTxRow;
 use crate::new_index::{Query, Utxo};
 use crate::util::electrum_merkle::{get_header_merkle_proof, get_id_from_pos, get_tx_merkle_proof};
-use crate::util::{create_socket, spawn_thread, BlockId, BoolThen, Channel, FullHash, HeaderEntry};
+use crate::util::{
+    bincode, create_socket, spawn_thread, BlockId, BoolThen, Channel, FullHash, HeaderEntry,
+    ScriptToAsm,
+};
 
 const ELECTRS_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 4);
@@ -309,6 +315,174 @@ impl Connection {
         }
     }
 
+    pub fn blockchain_block_tweaks(&mut self, params: &[Value]) -> Result<Value> {
+        let height: u32 = usize_from_value(params.get(0), "height")?
+            .try_into()
+            .unwrap();
+        // let _historical_mode =
+        //     bool_from_value_or(params.get(2), "historical", false).unwrap_or(false);
+
+        let sp_begin_height = self.query.sp_begin_height();
+        // let last_header_entry = self.query.chain().best_header();
+
+        let scan_height = if height < sp_begin_height {
+            sp_begin_height
+        } else {
+            height
+        };
+
+        let tweaks = self.query.block_tweaks(scan_height);
+        Ok(json!(tweaks))
+    }
+
+    // Progressively receive block tweak data per height iteration
+    // Client is expected to actively listen for messages until "done"
+    pub fn tweaks_subscribe(&mut self, params: &[Value]) -> Result<Value> {
+        let height: u32 = usize_from_value(params.get(0), "height")?
+            .try_into()
+            .unwrap();
+
+        let mut count: u32 = usize_from_value(params.get(1), "count")?
+            .try_into()
+            .unwrap();
+        if count > 1000 {
+            count = 1000;
+        }
+
+        let historical_mode =
+            bool_from_value_or(params.get(2), "historical", false).unwrap_or(false);
+
+        let sp_begin_height = self.query.sp_begin_height();
+        let last_header_entry = self.query.chain().best_header();
+        let last_blockchain_height = last_header_entry.height().try_into().unwrap();
+
+        let scan_height = if height < sp_begin_height {
+            sp_begin_height
+        } else {
+            height
+        };
+
+        let heights = scan_height + count;
+        let final_scanned_height = if last_blockchain_height <= heights {
+            last_blockchain_height + 1
+        } else {
+            heights
+        };
+
+        let mut tweak_map = HashMap::new();
+        let mut prev_height = scan_height;
+
+        let rows: Vec<_> = self
+            .query
+            .tweaks_iter_scan(scan_height, final_scanned_height)
+            .collect();
+
+        for row in rows {
+            let tweak_row = TweakTxRow::from_row(row);
+            let row_height = tweak_row.key.blockheight;
+            let is_new_block = row_height != prev_height;
+            let mut query_for_height_cached = None;
+
+            if is_new_block {
+                let _ = self.send_values(&[json!({"jsonrpc":"2.0","method":"blockchain.tweaks.subscribe","params":[{ prev_height.to_string(): tweak_map }]})]);
+                prev_height = row_height;
+                tweak_map = HashMap::new();
+            }
+
+            if row_height < last_blockchain_height - 5 {
+                let cached_height_for_tweak = self
+                    .query
+                    .chain()
+                    .get_tweak_cached_height(row_height)
+                    .unwrap_or(0);
+                query_for_height_cached = Some(last_blockchain_height == cached_height_for_tweak);
+            }
+
+            let txid = tweak_row.key.txid;
+            let tweak = tweak_row.get_tweak_data();
+            let mut vout_map = HashMap::new();
+
+            for vout in tweak.vout_data.clone().into_iter() {
+                let mut spend = vout.spending_input.clone();
+                let mut has_been_spent = spend.is_some();
+
+                if let Some(query_cached) = query_for_height_cached {
+                    let should_query = !has_been_spent && !query_cached;
+
+                    if should_query {
+                        spend = self.query.lookup_spend(&OutPoint {
+                            txid: txid.clone(),
+                            vout: vout.vout as u32,
+                        });
+
+                        has_been_spent = spend.is_some();
+                        let mut new_tweak = tweak.clone();
+                        new_tweak
+                            .vout_data
+                            .iter_mut()
+                            .find(|v| v.vout == vout.vout)
+                            .unwrap()
+                            .spending_input = spend.clone();
+
+                        let row = TweakTxRow::new(row_height, txid.clone(), &new_tweak);
+                        self.query.chain().store().tweak_db().put(
+                            &bincode::serialize_big(&row.key).unwrap(),
+                            &bincode::serialize_big(&row.value).unwrap(),
+                        );
+
+                        if is_new_block {
+                            self.query
+                                .chain()
+                                .store_tweak_cache_height(row_height, last_blockchain_height);
+                        }
+                    }
+
+                    let skip_this_vout = !historical_mode && has_been_spent;
+                    if skip_this_vout {
+                        continue;
+                    }
+                }
+
+                if let Some(pubkey) = &vout
+                    .script_pubkey
+                    .to_asm()
+                    .split(" ")
+                    .collect::<Vec<&str>>()
+                    .last()
+                {
+                    let mut items = json!([pubkey, vout.amount]);
+
+                    if historical_mode && has_been_spent {
+                        items
+                            .as_array_mut()
+                            .unwrap()
+                            .push(serde_json::to_value(&spend).unwrap());
+                    }
+
+                    vout_map.insert(vout.vout, items);
+                }
+            }
+
+            if !vout_map.is_empty() {
+                tweak_map.insert(
+                    txid.to_string(),
+                    json!({
+                        "tweak": tweak.tweak,
+                        "output_pubkeys": vout_map,
+                    }),
+                );
+            }
+        }
+
+        let _ = self.send_values(
+            &[json!({"jsonrpc":"2.0","method":"blockchain.tweaks.subscribe","params":[{ (final_scanned_height - 1).to_string(): tweak_map }]})]
+        );
+
+        let done = json!({"jsonrpc":"2.0","method":"blockchain.tweaks.subscribe","params":[{"message": "done"}]});
+        self.send_values(&[done.clone()])?;
+        Ok(done)
+    }
+
     #[cfg(not(feature = "liquid"))]
     fn blockchain_scripthash_get_balance(&self, params: &[Value]) -> Result<Value> {
         let script_hash = hash_from_value(params.get(0)).chain_err(|| "bad script_hash")?;
@@ -444,6 +618,12 @@ impl Connection {
         let result = match method {
             "blockchain.block.header" => self.blockchain_block_header(&params),
             "blockchain.block.headers" => self.blockchain_block_headers(&params),
+            "blockchain.block.tweaks" => self.blockchain_block_tweaks(params),
+            "blockchain.tweaks.subscribe" => self.tweaks_subscribe(params),
+            // "blockchain.tweaks.register" => self.tweaks_subscribe(params),
+            // "blockchain.tweaks.erase" => self.tweaks_subscribe(params),
+            // "blockchain.tweaks.get" => self.tweaks_subscribe(params),
+            // "blockchain.tweaks.scan" => self.tweaks_subscribe(params),
             "blockchain.estimatefee" => self.blockchain_estimatefee(&params),
             "blockchain.headers.subscribe" => self.blockchain_headers_subscribe(),
             "blockchain.relayfee" => self.blockchain_relayfee(),
@@ -870,7 +1050,7 @@ impl RPC {
                     let salt = salt_rwlock.read().unwrap().clone();
 
                     let spawned = spawn_thread("peer", move || {
-                        info!("[{}] connected peer", addr);
+                        debug!("[{}] connected peer", addr);
                         let conn = Connection::new(
                             query,
                             stream,
@@ -884,7 +1064,7 @@ impl RPC {
                             salt,
                         );
                         conn.run(receiver);
-                        info!("[{}] disconnected peer", addr);
+                        debug!("[{}] disconnected peer", addr);
                         let _ = garbage_sender.send(std::thread::current().id());
                     });
 

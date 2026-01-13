@@ -49,6 +49,12 @@ fn fetch_from(config: &Config, store: &Store) -> FetchFrom {
 }
 
 fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<()> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(16)
+        .thread_name(|i| format!("history-{}", i))
+        .build()
+        .unwrap();
+
     let (block_hash_notify, block_hash_receive) = channel::bounded(1);
     let signal = Waiter::start(block_hash_receive);
     let metrics = Metrics::new(config.monitoring_addr);
@@ -96,10 +102,17 @@ fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<(
         Arc::clone(&config),
     )));
 
-    while !Mempool::update(&mempool, &daemon, &tip)? {
-        // Mempool syncing was aborted because the chain tip moved;
-        // Index the new block(s) and try again.
-        tip = indexer.update(&daemon)?;
+    loop {
+        match Mempool::update(&mempool, &daemon) {
+            Ok(_) => break,
+            Err(e) => {
+                warn!(
+                    "Error performing initial mempool update, trying again in 5 seconds: {}",
+                    e.display_chain()
+                );
+                signal.wait(Duration::from_secs(5), false)?;
+            }
+        }
     }
 
     #[cfg(feature = "liquid")]
@@ -149,8 +162,12 @@ fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<(
         };
 
         // Update mempool
-        if !Mempool::update(&mempool, &daemon, &tip)? {
-            warn!("skipped failed mempool update, trying again in 5 seconds");
+        if let Err(e) = Mempool::update(&mempool, &daemon) {
+            // Log the error if the result is an Err
+            warn!(
+                "Error updating mempool, skipping mempool update: {}",
+                e.display_chain()
+            );
         }
 
         // Update subscribed clients

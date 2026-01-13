@@ -508,19 +508,14 @@ impl Mempool {
             .map_or_else(|| vec![], |entries| self._history(entries, limit))
     }
 
-    /// Sync our local view of the mempool with the bitcoind Daemon RPC. If the chain tip moves before
-    /// the mempool is fetched in full, syncing is aborted and an Ok(false) is returned.
-    #[trace]
-    pub fn update(
-        mempool: &Arc<RwLock<Mempool>>,
-        daemon: &Daemon,
-        tip: &BlockHash,
-    ) -> Result<bool> {
-        let (_timer, count) = {
-            let mempool = mempool.read().unwrap();
-            let timer = mempool.latency.with_label_values(&["update"]).start_timer();
-            (timer, mempool.count.clone())
-        };
+    pub fn update(mempool: &Arc<RwLock<Mempool>>, daemon: &Daemon) -> Result<()> {
+        debug!("Starting Mempool update");
+        let _timer = mempool
+            .read()
+            .unwrap()
+            .latency
+            .with_label_values(&["update"])
+            .start_timer();
 
         // Get bitcoind's current list of mempool txids
         let bitcoind_txids = daemon
@@ -538,102 +533,36 @@ impl Mempool {
             mempool.write().unwrap().remove(evicted_txids);
         } // avoids acquiring a lock when there are no evictions
 
-        // Find transactions available in bitcoind's mempool but not indexed locally
-        let new_txids = bitcoind_txids
-            .difference(&indexed_txids)
-            .collect::<Vec<_>>();
+        // 4. Update local mempool to match daemon's state
+        if !mempool.read().unwrap().config.skip_mempool {
+            // Find transactions available in bitcoind's mempool but not indexed locally
+            let new_txids = bitcoind_txids
+                .difference(&indexed_txids)
+                .collect::<Vec<_>>();
 
-        debug!(
-            "mempool with total {} txs, {} indexed locally, {} to fetch",
-            bitcoind_txids.len(),
-            indexed_txids.len(),
-            new_txids.len()
-        );
-        count
-            .with_label_values(&["all_txs"])
-            .set(bitcoind_txids.len() as f64);
-        count
-            .with_label_values(&["indexed_txs"])
-            .set(indexed_txids.len() as f64);
-        count
-            .with_label_values(&["missing_txs"])
-            .set(new_txids.len() as f64);
+            if !new_txids.is_empty() {
+                // Fetch missing transactions from bitcoind
+                let fetched_txs = daemon.gettransactions_available(&new_txids)?;
 
-        if new_txids.is_empty() {
-            return Ok(true);
-        }
+                let mut mempool = mempool.write().unwrap();
+                mempool.add(fetched_txs)?;
 
-        // Fetch missing transactions from bitcoind
-        let mut fetched_txs = daemon.gettransactions_available(&new_txids)?;
+                mempool.count
+                    .with_label_values(&["txs"])
+                    .set(mempool.txstore.len() as f64);
 
-        // Abort if the chain tip moved while fetching transactions
-        if daemon.getbestblockhash()? != *tip {
-            warn!("chain tip moved while updating mempool");
-            return Ok(false);
-        }
-
-        // Find which transactions were requested but are no longer available in bitcoind's mempool,
-        // typically due to Replace-By-Fee (or mempool eviction for some other reason) taking place
-        // between querying for the mempool txids and querying for the transactions themselves.
-        let mut replaced_txids: HashSet<_> = new_txids
-            .into_iter()
-            .filter(|txid| !fetched_txs.contains_key(*txid))
-            .cloned()
-            .collect();
-
-        if replaced_txids.is_empty() {
-            trace!("fetched complete mempool snapshot");
-        } else {
-            warn!(
-                "could not to fetch {} replaced/evicted mempool transactions: {:?}",
-                replaced_txids.len(),
-                replaced_txids.iter().take(10).collect::<Vec<_>>()
-            );
-        }
-
-        // If we were unable to get a complete consistent snapshot of the bitcoind mempool,
-        // detect and remove any transactions that spend from the missing (replaced) transactions
-        // or any of their descendants. This is necessary because it could be possible to fetch the
-        // child tx successfully before the parent is replaced, but miss the replaced parent tx.
-        while !replaced_txids.is_empty() {
-            let mut descendants_txids = HashSet::new();
-            fetched_txs.retain(|txid, tx| {
-                let parent_was_replaced = tx
-                    .input
-                    .iter()
-                    .any(|txin| replaced_txids.contains(&txin.previous_output.txid));
-                if parent_was_replaced {
-                    descendants_txids.insert(*txid);
+                // Update cached backlog stats (if expired)
+                if mempool.backlog_stats.1.elapsed() > Duration::from_secs(BACKLOG_STATS_TTL) {
+                    mempool.update_backlog_stats();
                 }
-                !parent_was_replaced
-            });
-            trace!(
-                "detected {} replaced mempool descendants",
-                descendants_txids.len()
-            );
-            replaced_txids = descendants_txids;
-        }
-
-        // Add fetched transactions to our view of the mempool
-        trace!("indexing {} new mempool transactions", fetched_txs.len());
-        if !fetched_txs.is_empty() {
-            let mut mempool = mempool.write().unwrap();
-
-            mempool.add(fetched_txs)?;
-
-            count
-                .with_label_values(&["txs"])
-                .set(mempool.txstore.len() as f64);
-
-            // Update cached backlog stats (if expired)
-            if mempool.backlog_stats.1.elapsed() > Duration::from_secs(BACKLOG_STATS_TTL) {
-                mempool.update_backlog_stats();
             }
+        } else {
+            debug!("Skipping mempool update");
         }
 
         trace!("mempool is synced");
 
-        Ok(true)
+        Ok(())
     }
 }
 

@@ -1159,7 +1159,7 @@ impl ChainQuery {
 
         tweaks
             .into_iter()
-            .map(|tweak| tweak.to_lower_hex_string())
+            .map(|tweak| DisplayHex::to_lower_hex_string(&tweak))
             .collect()
     }
 

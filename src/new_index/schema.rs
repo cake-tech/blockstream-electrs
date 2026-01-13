@@ -1,6 +1,5 @@
 use bitcoin::hashes::sha256d::Hash as Sha256dHash;
-use bitcoin::hex::{DisplayHex as BitcoinDisplayHex, FromHex};
-use bitcoin::hex_conservative::DisplayHex;
+use bitcoin::hex::{DisplayHex, FromHex};
 #[cfg(not(feature = "liquid"))]
 use bitcoin::merkle_tree::MerkleBlock;
 use bitcoin::{Amount, Witness};
@@ -652,7 +651,7 @@ impl Indexer {
                         blockheight,
                         txid.clone(),
                         &TweakData {
-                            tweak: tweak_bytes.to_lower_hex_string(),
+                            tweak: bytes_to_hex(&tweak_bytes),
                             vout_data: output_pubkeys.clone(),
                         },
                     )
@@ -1159,7 +1158,7 @@ impl ChainQuery {
 
         tweaks
             .into_iter()
-            .map(|tweak| DisplayHex::to_lower_hex_string(&tweak))
+            .map(|tweak| bytes_to_hex(&tweak))
             .collect()
     }
 
@@ -1566,6 +1565,11 @@ fn addr_search_row(spk: &Script, network: Network) -> Option<DBRow> {
 
 fn addr_search_filter(prefix: &str) -> Bytes {
     [b"a", prefix.as_bytes()].concat()
+}
+
+// Helper function to convert bytes to hex string
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 // TODO: replace by a separate opaque type (similar to Sha256dHash, but without the "double")

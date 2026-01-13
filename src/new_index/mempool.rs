@@ -12,7 +12,7 @@ use std::iter::FromIterator;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use crate::chain::{deserialize, BlockHash, Network, OutPoint, Transaction, TxOut, Txid};
+use crate::chain::{deserialize, Network, OutPoint, Transaction, TxOut, Txid};
 use crate::config::Config;
 use crate::daemon::Daemon;
 use crate::errors::*;

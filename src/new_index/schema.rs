@@ -1,12 +1,11 @@
 use bitcoin::hashes::sha256d::Hash as Sha256dHash;
-use bitcoin::hex::FromHex;
+use bitcoin::hex::{DisplayHex as BitcoinDisplayHex, FromHex};
+use bitcoin::hex_conservative::DisplayHex;
 #[cfg(not(feature = "liquid"))]
 use bitcoin::merkle_tree::MerkleBlock;
-use bitcoin::VarInt;
 use bitcoin::{Amount, Witness};
 use crypto::digest::Digest;
 use crypto::sha2::Sha256;
-use hex::{DisplayHex, FromHex};
 use itertools::Itertools;
 use rayon::prelude::*;
 
@@ -454,7 +453,7 @@ impl Indexer {
 
                     let mut rows = vec![];
                     for tx in &b.block.txdata {
-                        let txid = full_hash(&tx.txid()[..]);
+                        let txid = full_hash(&tx.compute_txid()[..]);
                         // persist history index:
                         //      H{funding-scripthash}{funding-height}F{funding-txid:vout} → ""
                         //      H{funding-scripthash}{spending-height}S{spending-txid:vin}{funding-txid:vout} → ""
@@ -585,14 +584,13 @@ impl Indexer {
         rows: &mut Vec<DBRow>,
         tweaks: &mut Vec<Vec<u8>>,
     ) {
-        let txid = &tx.txid();
+        let txid = &tx.compute_txid();
         let mut output_pubkeys: Vec<VoutData> = Vec::with_capacity(tx.output.len());
 
         for (txo_index, txo) in tx.output.iter().enumerate() {
             if is_spendable(txo) {
                 let amount = (txo.value as Amount).to_sat();
-                #[allow(deprecated)]
-                if txo.script_pubkey.is_v1_p2tr()
+                if txo.script_pubkey.is_p2tr()
                     && amount >= self.iconfig.sp_min_dust.unwrap_or(1_000) as u64
                 {
                     output_pubkeys.push(VoutData {
@@ -648,12 +646,13 @@ impl Indexer {
             if let Some(tweak) = calculate_tweak_data(&pubkeys_ref, &outpoints).ok() {
                 // persist tweak index:
                 //      K{blockhash}{txid} → {tweak}{serialized-vout-data}
+                let tweak_bytes: [u8; 33] = tweak.serialize();
                 rows.push(
                     TweakTxRow::new(
                         blockheight,
                         txid.clone(),
                         &TweakData {
-                            tweak: tweak.serialize().to_lower_hex_string(),
+                            tweak: tweak_bytes.to_lower_hex_string(),
                             vout_data: output_pubkeys.clone(),
                         },
                     )
@@ -1372,7 +1371,7 @@ fn add_blocks(block_entries: &[BlockEntry], iconfig: &IndexerConfig) -> Vec<DBRo
         .map(|b| {
             let mut rows = vec![];
             let blockhash = full_hash(&b.entry.hash()[..]);
-            let txids: Vec<Txid> = b.block.txdata.iter().map(|tx| tx.txid()).collect();
+            let txids: Vec<Txid> = b.block.txdata.iter().map(|tx| tx.compute_txid()).collect();
 
             for tx in &b.block.txdata {
                 rows.push(TxConfRow::new(tx, blockhash).into_row());
@@ -1381,7 +1380,7 @@ fn add_blocks(block_entries: &[BlockEntry], iconfig: &IndexerConfig) -> Vec<DBRo
                     rows.push(TxRow::new(tx).into_row());
                 }
 
-                let txid = full_hash(&tx.txid()[..]);
+                let txid = full_hash(&tx.compute_txid()[..]);
                 for (txo_index, txo) in tx.output.iter().enumerate() {
                     if is_spendable(txo) {
                         rows.push(TxOutRow::new(&txid, txo_index, txo).into_row());
@@ -1597,7 +1596,7 @@ struct TxRow {
 
 impl TxRow {
     fn new(txn: &Transaction) -> TxRow {
-        let txid = full_hash(&txn.txid()[..]);
+        let txid = full_hash(&txn.compute_txid()[..]);
         TxRow {
             key: TxRowKey { code: b'T', txid },
             value: serialize(txn),
@@ -1630,7 +1629,7 @@ struct TxConfRow {
 
 impl TxConfRow {
     fn new(txn: &Transaction, blockhash: FullHash) -> TxConfRow {
-        let txid = full_hash(&txn.txid()[..]);
+        let txid = full_hash(&txn.compute_txid()[..]);
         TxConfRow {
             key: TxConfKey {
                 code: b'C',

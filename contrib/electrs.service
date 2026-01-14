@@ -3,10 +3,22 @@ Description=Electrum Rust Server
 
 [Service]
 Type=simple
-ExecStart=/path/to/electrs/target/release/electrs -vvvv --db-dir /path/to/electrs/db/
+# Update these paths to match your installation
+# Binary path: /opt/electrs/target/release/electrs
+# DB directory: /root/electrs-db (or your preferred location)
+# Daemon RPC: 127.0.0.1:8332 (default)
+# Electrum RPC: 127.0.0.1:50001 (default)
+ExecStart=/opt/electrs/target/release/electrs \
+    --network=mainnet \
+    --db-dir=/root/electrs-db \
+    --daemon-rpc-addr=127.0.0.1:8332 \
+    --electrum-rpc-addr=127.0.0.1:50001 \
+    --sp-begin-height=823807 \
+    --sp-check-spends
 Restart=on-failure
 RestartSec=60
 Environment="RUST_BACKTRACE=1"
+WorkingDirectory=/opt/electrs
 
 # Hardening measures
 PrivateTmp=true

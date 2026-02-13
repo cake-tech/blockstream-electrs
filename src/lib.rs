@@ -1,11 +1,5 @@
 #![recursion_limit = "1024"]
 
-// See https://github.com/romanz/electrs/issues/193 & https://github.com/rust-rocksdb/rust-rocksdb/issues/327
-#[cfg(not(feature = "oldcpu"))]
-extern crate rocksdb;
-#[cfg(feature = "oldcpu")]
-extern crate rocksdb_oldcpu as rocksdb;
-
 #[macro_use]
 extern crate clap;
 #[macro_use]
@@ -18,7 +12,6 @@ extern crate log;
 extern crate serde_derive;
 #[macro_use]
 extern crate serde_json;
-
 #[macro_use]
 extern crate lazy_static;
 
@@ -35,3 +28,6 @@ pub mod util;
 
 #[cfg(feature = "liquid")]
 pub mod elements;
+
+#[cfg(feature = "otlp-tracing")]
+pub mod otlp_trace;

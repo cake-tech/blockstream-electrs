@@ -1,6 +1,8 @@
+use std::str::FromStr;
 use std::sync::{Arc, Once, RwLock};
 use std::{env, net};
 
+use log::LevelFilter;
 use stderrlog::StdErrLog;
 use tempfile::TempDir;
 
@@ -25,6 +27,7 @@ use electrs::{
     rest,
     signal::Waiter,
 };
+use electrs::config::RpcLogging;
 
 pub struct TestRunner {
     config: Arc<Config>,
@@ -36,6 +39,7 @@ pub struct TestRunner {
     daemon: Arc<Daemon>,
     mempool: Arc<RwLock<Mempool>>,
     metrics: Metrics,
+    salt_rwlock: Arc<RwLock<String>>,
 }
 
 impl TestRunner {
@@ -53,7 +57,7 @@ impl TestRunner {
             #[cfg(feature = "liquid")]
             node_conf.args.push("-anyonecanspendaremine=1");
 
-            node_conf.view_stdout = true;
+            node_conf.view_stdout = std::env::var_os("RUST_LOG").is_some();
         }
 
         // Setup node
@@ -89,6 +93,7 @@ impl TestRunner {
             network_type,
             db_path: electrsdb.path().to_path_buf(),
             daemon_dir: daemon_subdir.clone(),
+            daemon_parallelism: 3,
             blocks_dir: daemon_subdir.join("blocks"),
             daemon_rpc_addr: params.rpc_socket.into(),
             cookie: None,
@@ -105,12 +110,17 @@ impl TestRunner {
             utxos_limit: 100,
             electrum_txs_limit: 100,
             electrum_banner: "".into(),
-            electrum_rpc_logging: None,
+            rpc_logging: RpcLogging::default(),
+            zmq_addr: None,
 
             #[cfg(feature = "liquid")]
             asset_db_path: None, // XXX
             #[cfg(feature = "liquid")]
             parent_network: bitcoin::Network::Regtest,
+            initial_sync_compaction: false,
+            db_block_cache_mb: 8,
+            db_parallelism: 2,
+            db_write_buffer_size_mb: 256,
             //#[cfg(feature = "electrum-discovery")]
             //electrum_public_hosts: Option<crate::electrum::ServerHosts>,
             //#[cfg(feature = "electrum-discovery")]
@@ -119,7 +129,7 @@ impl TestRunner {
             //tor_proxy: Option<std::net::SocketAddr>,
         });
 
-        let signal = Waiter::start();
+        let signal = Waiter::start(crossbeam_channel::never());
         let metrics = Metrics::new(rand_available_addr());
         metrics.start();
 
@@ -127,13 +137,14 @@ impl TestRunner {
             &config.daemon_dir,
             &config.blocks_dir,
             config.daemon_rpc_addr,
+            config.daemon_parallelism,
             config.cookie_getter(),
             config.network_type,
             signal.clone(),
             &metrics,
         )?);
 
-        let store = Arc::new(Store::open(&config.db_path.join("newindex"), &config));
+        let store = Arc::new(Store::open(&config, &metrics, true));
 
         let fetch_from = if !env::var("JSONRPC_IMPORT").is_ok() && !cfg!(feature = "liquid") {
             // run the initial indexing from the blk files then switch to using the jsonrpc,
@@ -147,7 +158,7 @@ impl TestRunner {
         };
 
         let mut indexer = Indexer::open(Arc::clone(&store), fetch_from, &config, &metrics);
-        indexer.update(&daemon)?;
+        let tip = indexer.update(&daemon)?;
         indexer.fetch_from(FetchFrom::Bitcoind);
 
         let chain = Arc::new(ChainQuery::new(
@@ -162,7 +173,7 @@ impl TestRunner {
             &metrics,
             Arc::clone(&config),
         )));
-        Mempool::update(&mempool, &daemon)?;
+        assert!(Mempool::update(&mempool, &daemon, &tip)?);
 
         let query = Arc::new(Query::new(
             Arc::clone(&chain),
@@ -173,6 +184,8 @@ impl TestRunner {
             None, // TODO
         ));
 
+        let salt_rwlock = Arc::new(RwLock::new(String::from("foobar")));
+
         Ok(TestRunner {
             config,
             node,
@@ -182,6 +195,7 @@ impl TestRunner {
             daemon,
             mempool,
             metrics,
+            salt_rwlock,
         })
     }
 
@@ -193,8 +207,8 @@ impl TestRunner {
     }
 
     pub fn sync(&mut self) -> Result<()> {
-        self.indexer.update(&self.daemon)?;
-        Mempool::update(&self.mempool, &self.daemon)?;
+        let tip = self.indexer.update(&self.daemon)?;
+        assert!(Mempool::update(&self.mempool, &self.daemon, &tip)?);
         // force an update for the mempool stats, which are normally cached
         self.mempool.write().unwrap().update_backlog_stats();
         Ok(())
@@ -262,6 +276,18 @@ impl TestRunner {
     }
 }
 
+// Make the RpcApi methods available directly on TestRunner,
+// without having to go through the node_client() getter
+impl bitcoincore_rpc::RpcApi for TestRunner {
+    fn call<T: for<'a> serde::de::Deserialize<'a>>(
+        &self,
+        cmd: &str,
+        args: &[serde_json::Value],
+    ) -> bitcoincore_rpc::Result<T> {
+        self.node_client().call(cmd, args)
+    }
+}
+
 pub fn init_rest_tester() -> Result<(rest::Handle, net::SocketAddr, TestRunner)> {
     let tester = TestRunner::new()?;
     let rest_server = rest::start(Arc::clone(&tester.config), Arc::clone(&tester.query));
@@ -274,6 +300,7 @@ pub fn init_electrum_tester() -> Result<(ElectrumRPC, net::SocketAddr, TestRunne
         Arc::clone(&tester.config),
         Arc::clone(&tester.query),
         &tester.metrics,
+        Arc::clone(&tester.salt_rwlock),
     );
     log::info!(
         "Electrum server running on {}",
@@ -310,7 +337,11 @@ fn generate(
 fn init_log() -> StdErrLog {
     static ONCE: Once = Once::new();
     let mut log = stderrlog::new();
-    log.verbosity(4);
+    match std::env::var("RUST_LOG") {
+        Ok(e) => log.verbosity(LevelFilter::from_str(&e).unwrap_or(LevelFilter::Off)),
+        Err(_) => log.verbosity(0),
+    };
+
     // log.timestamp(stderrlog::Timestamp::Millisecond        );
     ONCE.call_once(|| log.init().expect("logging initialization failed"));
     log

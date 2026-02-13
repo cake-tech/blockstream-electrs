@@ -4,25 +4,33 @@ extern crate log;
 
 extern crate electrs;
 
+use crossbeam_channel::{self as channel};
 use error_chain::ChainedError;
-use std::process;
+use std::{env, process, thread};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-
+use bitcoin::hex::DisplayHex;
+use rand::{rng, RngCore};
 use electrs::{
     config::Config,
     daemon::Daemon,
     electrum::RPC as ElectrumRPC,
     errors::*,
     metrics::Metrics,
-    new_index::{precache, ChainQuery, FetchFrom, Indexer, Mempool, Query, Store},
+    new_index::{precache, zmq, ChainQuery, FetchFrom, Indexer, Mempool, Query, Store},
     rest,
     signal::Waiter,
 };
 
+#[cfg(feature = "otlp-tracing")]
+use electrs::otlp_trace;
+
 #[cfg(feature = "liquid")]
 use electrs::elements::AssetRegistry;
 use electrs::metrics::MetricOpts;
+
+/// Default salt rotation interval in seconds (24 hours)
+const DEFAULT_SALT_ROTATION_INTERVAL_SECS: u64 = 24 * 3600;
 
 fn fetch_from(config: &Config, store: &Store) -> FetchFrom {
     let mut jsonrpc_import = config.jsonrpc_import;
@@ -40,27 +48,33 @@ fn fetch_from(config: &Config, store: &Store) -> FetchFrom {
     }
 }
 
-fn run_server(config: Arc<Config>) -> Result<()> {
+fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<()> {
     rayon::ThreadPoolBuilder::new()
         .num_threads(16)
         .thread_name(|i| format!("history-{}", i))
         .build()
         .unwrap();
 
-    let signal = Waiter::start();
+    let (block_hash_notify, block_hash_receive) = channel::bounded(1);
+    let signal = Waiter::start(block_hash_receive);
     let metrics = Metrics::new(config.monitoring_addr);
     metrics.start();
+
+    if let Some(zmq_addr) = config.zmq_addr.as_ref() {
+        zmq::start(&format!("tcp://{zmq_addr}"), block_hash_notify);
+    }
 
     let daemon = Arc::new(Daemon::new(
         &config.daemon_dir,
         &config.blocks_dir,
         config.daemon_rpc_addr,
+        config.daemon_parallelism,
         config.cookie_getter(),
         config.network_type,
         signal.clone(),
         &metrics,
     )?);
-    let store = Arc::new(Store::open(&config.db_path.join("newindex"), &config));
+    let store = Arc::new(Store::open(&config, &metrics, true));
     let mut indexer = Indexer::open(
         Arc::clone(&store),
         fetch_from(&config, &store),
@@ -87,17 +101,10 @@ fn run_server(config: Arc<Config>) -> Result<()> {
         &metrics,
         Arc::clone(&config),
     )));
-    loop {
-        match Mempool::update(&mempool, &daemon) {
-            Ok(_) => break,
-            Err(e) => {
-                warn!(
-                    "Error performing initial mempool update, trying again in 5 seconds: {}",
-                    e.display_chain()
-                );
-                signal.wait(Duration::from_secs(5), false)?;
-            }
-        }
+    while !Mempool::update(&mempool, &daemon, &tip)? {
+        // Mempool syncing was aborted because the chain tip moved;
+        // Index the new block(s) and try again.
+        tip = indexer.update(&daemon)?;
     }
 
     #[cfg(feature = "liquid")]
@@ -118,7 +125,12 @@ fn run_server(config: Arc<Config>) -> Result<()> {
 
     // TODO: configuration for which servers to start
     let rest_server = rest::start(Arc::clone(&config), Arc::clone(&query));
-    let electrum_server = ElectrumRPC::start(Arc::clone(&config), Arc::clone(&query), &metrics);
+    let electrum_server = ElectrumRPC::start(
+        Arc::clone(&config),
+        Arc::clone(&query),
+        &metrics,
+        Arc::clone(&salt_rwlock),
+    );
 
     let main_loop_count = metrics.gauge(MetricOpts::new(
         "electrs_main_loop_count",
@@ -138,17 +150,12 @@ fn run_server(config: Arc<Config>) -> Result<()> {
         // Index new blocks
         let current_tip = daemon.getbestblockhash()?;
         if current_tip != tip {
-            indexer.update(&daemon)?;
-            tip = current_tip;
+            tip = indexer.update(&daemon)?;
         };
 
         // Update mempool
-        if let Err(e) = Mempool::update(&mempool, &daemon) {
-            // Log the error if the result is an Err
-            warn!(
-                "Error updating mempool, skipping mempool update: {}",
-                e.display_chain()
-            );
+        if !Mempool::update(&mempool, &daemon, &tip)? {
+            warn!("skipped failed mempool update, trying again in 5 seconds");
         }
 
         // Update subscribed clients
@@ -158,10 +165,63 @@ fn run_server(config: Arc<Config>) -> Result<()> {
     Ok(())
 }
 
-fn main() {
+fn generate_salt() -> String {
+    let mut random_bytes = [0u8; 32];
+    rng().fill_bytes(&mut random_bytes);
+    random_bytes.to_lower_hex_string()
+}
+
+fn rotate_salt(salt: &mut String) {
+    *salt = generate_salt();
+}
+
+fn get_salt_rotation_interval() -> Duration {
+    let var_name = "SALT_ROTATION_INTERVAL_SECS";
+    let secs = env::var(var_name)
+        .ok()
+        .and_then(|val| val.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SALT_ROTATION_INTERVAL_SECS);
+
+    Duration::from_secs(secs)
+}
+
+fn spawn_salt_rotation_thread() -> Arc<RwLock<String>> {
+    let salt = generate_salt();
+    let salt_rwlock = Arc::new(RwLock::new(salt));
+    let writer_arc = Arc::clone(&salt_rwlock);
+    let interval = get_salt_rotation_interval();
+
+    thread::spawn(move || {
+        loop {
+            thread::sleep(interval); // 24 hours
+            {
+                let mut guard = writer_arc.write().unwrap();
+                rotate_salt(&mut *guard);
+                info!("Salt rotated");
+            }
+        }
+    });
+    salt_rwlock
+}
+
+fn main_() {
+    let salt_rwlock = spawn_salt_rotation_thread();
+
     let config = Arc::new(Config::from_args());
-    if let Err(e) = run_server(config) {
+    if let Err(e) = run_server(config, Arc::clone(&salt_rwlock)) {
         error!("server failed: {}", e.display_chain());
         process::exit(1);
     }
+}
+
+#[cfg(not(feature = "otlp-tracing"))]
+fn main() {
+    main_();
+}
+
+#[cfg(feature = "otlp-tracing")]
+#[tokio::main]
+async fn main() {
+    let _tracing_guard = otlp_trace::init_tracing("electrs");
+    main_()
 }

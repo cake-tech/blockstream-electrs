@@ -1,53 +1,71 @@
 name: CI
 
-on: [push, pull_request]
+on:
+  push:
+    branches:
+      - new-index
+  pull_request: {}
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  test:
-    runs-on: ubuntu-20.04
-    env:
-      CARGO_TERM_COLOR: always
-
+  check:
+    runs-on: ubuntu-22.04
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@1.75.0
+    - uses: Swatinem/rust-cache@v2
+    - name: Run cargo check --all-targets
+      run: cargo check --all-targets
 
-    - name: Cache cargo registry
-      uses: actions/cache@v1
-      with:
-        path: ~/.cargo/registry
-        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+    - run: sudo apt-get update && sudo apt-get install libfuse2
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@1.75.0
+    - uses: Swatinem/rust-cache@v2
+    - name: Run tests (Bitcoin mode, REST+Electrum)
+      run: RUST_LOG=debug cargo test
 
-    - name: Cache cargo index
-      uses: actions/cache@v1
-      with:
-        path: ~/.cargo/git
-        key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+  test-bitcoin-28:
+    runs-on: ubuntu-22.04
+    steps:
+    - run: sudo apt-get update && sudo apt-get install libfuse2
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@1.75.0
+    - uses: Swatinem/rust-cache@v2
+    - name: Download bitcoind 28.0
+      run: |
+        curl -sSL https://bitcoincore.org/bin/bitcoin-core-28.0/bitcoin-28.0-x86_64-linux-gnu.tar.gz | tar -xz
+        chmod +x bitcoin-28.0/bin/bitcoind
+    - name: Run tests (Bitcoin 28.0, REST+Electrum)
+      run: RUST_LOG=debug cargo test --features bitcoind_28_0
+      env:
+        BITCOIND_EXE: ${{ github.workspace }}/bitcoin-28.0/bin/bitcoind
 
-    - name: Cache cargo build
-      uses: actions/cache@v1
-      with:
-        path: target
-        key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+  test-electrum-raw:
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@1.75.0
+    - uses: Swatinem/rust-cache@v2
+    - name: Run test test_electrum_raw
+      run: RUST_LOG=debug cargo test -- --include-ignored test_electrum_raw
 
-    #- name: Check formatting
-    #  run: cargo fmt -- --check
-
-    - name: Setup Rust toolchain
-      run: rustup default 1.75.0
-
-    - name: Check for errors
-      run: cargo check
-
-    - name: Tests (Bitcoin mode, REST+Electrum)
-      run: cargo test
-
-    - name: Tests (Liquid mode, REST)
-      run: cargo test --features liquid
+  test-liquid:
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@1.75.0
+    - uses: Swatinem/rust-cache@v2
+    - name: Run tests (Liquid mode, REST)
+      run: RUST_LOG=debug cargo test --features liquid
 
   nix:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@main
       - run: nix build .
-

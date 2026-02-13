@@ -5,17 +5,18 @@ use crate::chain::{
 use crate::config::Config;
 use crate::errors;
 use crate::new_index::{compute_script_hash, Query, SpendingInput, Utxo};
+#[cfg(feature = "liquid")]
+use crate::util::optional_value_for_newer_blocks;
 use crate::util::{
     create_socket, electrum_merkle, extract_tx_prevouts, get_innerscripts, get_tx_fee, has_prevout,
     is_coinbase, BlockHeaderMeta, BlockId, FullHash, ScriptToAddr, ScriptToAsm, TransactionStatus,
     DEFAULT_BLOCKHASH,
 };
-
 #[cfg(not(feature = "liquid"))]
 use bitcoin::consensus::encode;
 
 use bitcoin::hashes::FromSliceError as HashError;
-use hex::{DisplayHex, FromHex};
+use bitcoin::hex::{self, DisplayHex, FromHex, HexToBytesIter};
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Method, Response, Server, StatusCode};
 use hyperlocal::UnixServerExt;
@@ -23,6 +24,8 @@ use tokio::sync::oneshot;
 
 use std::fs;
 use std::str::FromStr;
+
+use electrs_macros::trace;
 
 #[cfg(feature = "liquid")]
 use {
@@ -48,6 +51,8 @@ const ADDRESS_SEARCH_LIMIT: usize = 10;
 const ASSETS_PER_PAGE: usize = 25;
 #[cfg(feature = "liquid")]
 const ASSETS_MAX_PER_PAGE: usize = 100;
+#[cfg(feature = "liquid")]
+const START_OF_LIQUID_DISCOUNT_CT_POLICY: u32 = 1734120000; // Friday, December 13, 2024, 20:00 GMT
 
 const TTL_LONG: u32 = 157_784_630; // ttl for static resources (5 years)
 const TTL_SHORT: u32 = 10; // ttl for volatie resources
@@ -127,6 +132,14 @@ struct TransactionValue {
     fee: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<TransactionStatus>,
+
+    #[cfg(feature = "liquid")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    discount_vsize: Option<usize>,
+
+    #[cfg(feature = "liquid")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    discount_weight: Option<usize>,
 }
 
 impl TransactionValue {
@@ -158,7 +171,7 @@ impl TransactionValue {
         let weight = weight.to_wu();
 
         TransactionValue {
-            txid: tx.txid(),
+            txid: tx.compute_txid(),
             #[cfg(not(feature = "liquid"))]
             version: tx.version.0 as u32,
             #[cfg(feature = "liquid")]
@@ -170,6 +183,20 @@ impl TransactionValue {
             weight: weight as u64,
             fee,
             status: Some(TransactionStatus::from(blockid)),
+
+            #[cfg(feature = "liquid")]
+            discount_vsize: optional_value_for_newer_blocks(
+                blockid,
+                START_OF_LIQUID_DISCOUNT_CT_POLICY,
+                tx.discount_vsize(),
+            ),
+
+            #[cfg(feature = "liquid")]
+            discount_weight: optional_value_for_newer_blocks(
+                blockid,
+                START_OF_LIQUID_DISCOUNT_CT_POLICY,
+                tx.discount_weight(),
+            ),
         }
     }
 }
@@ -319,7 +346,7 @@ impl TxOutValue {
             "v0_p2wsh"
         } else if script.is_p2tr() {
             "v1_p2tr"
-        } else if script.is_provably_unspendable() {
+        } else if script.is_op_return() {
             "provably_unspendable"
         } else {
             "unknown"
@@ -579,6 +606,7 @@ impl Handle {
     }
 }
 
+#[trace]
 fn handle_request(
     method: Method,
     uri: hyper::Uri,
@@ -690,41 +718,28 @@ fn handle_request(
         }
         (&Method::GET, Some(&"block"), Some(hash), Some(&"txs"), start_index, None) => {
             let hash = BlockHash::from_str(hash)?;
-            let txids = query
-                .chain()
-                .get_block_txids(&hash)
-                .ok_or_else(|| HttpError::not_found("Block not found".to_string()))?;
-
             let start_index = start_index
                 .map_or(0u32, |el| el.parse().unwrap_or(0))
                 .max(0u32) as usize;
-            if start_index >= txids.len() {
-                bail!(HttpError::not_found("start index out of range".to_string()));
-            } else if start_index % CHAIN_TXS_PER_PAGE != 0 {
-                bail!(HttpError::from(format!(
-                    "start index must be a multipication of {}",
-                    CHAIN_TXS_PER_PAGE
-                )));
-            }
 
-            // blockid_by_hash() only returns the BlockId for non-orphaned blocks,
-            // or None for orphaned
-            let confirmed_blockid = query.chain().blockid_by_hash(&hash);
+            ensure!(
+                start_index % CHAIN_TXS_PER_PAGE == 0,
+                "start index must be a multipication of {}",
+                CHAIN_TXS_PER_PAGE
+            );
 
-            let txs = txids
-                .iter()
-                .skip(start_index)
-                .take(CHAIN_TXS_PER_PAGE)
-                .map(|txid| {
-                    query
-                        .lookup_txn(&txid)
-                        .map(|tx| (tx, confirmed_blockid.clone()))
-                        .ok_or_else(|| "missing tx".to_string())
-                })
-                .collect::<Result<Vec<(Transaction, Option<BlockId>)>, _>>()?;
+            // The BlockId would not be available for stale blocks
+            let blockid = query.chain().blockid_by_hash(&hash);
 
-            // XXX orphraned blocks alway get TTL_SHORT
-            let ttl = ttl_by_depth(confirmed_blockid.map(|b| b.height), query);
+            let txs = query
+                .chain()
+                .get_block_txs(&hash, start_index, CHAIN_TXS_PER_PAGE)?
+                .into_iter()
+                .map(|tx| (tx, blockid))
+                .collect();
+
+            // XXX stale blocks alway get TTL_SHORT
+            let ttl = ttl_by_depth(blockid.map(|b| b.height), query);
 
             json_response(prepare_txs(txs, query, config), ttl)
         }
@@ -968,7 +983,7 @@ fn handle_request(
                 .lookup_txn(&hash)
                 .ok_or_else(|| HttpError::not_found("Transaction not found".to_string()))?;
             let spends: Vec<SpendingValue> = query
-                .lookup_tx_spends(tx)
+                .lookup_tx_spends(&tx)
                 .into_iter()
                 .map(|spend| spend.map_or_else(SpendingValue::default, SpendingValue::from))
                 .collect();
@@ -987,10 +1002,65 @@ fn handle_request(
                     .ok_or_else(|| HttpError::from("Missing tx".to_string()))?,
                 _ => return http_message(StatusCode::METHOD_NOT_ALLOWED, "Invalid method", 0),
             };
-            let txid = query
-                .broadcast_raw(&txhex)
-                .map_err(|err| HttpError::from(err.description().to_string()))?;
+            let txid = query.broadcast_raw(&txhex)?;
             http_message(StatusCode::OK, txid.to_string(), 0)
+        }
+        (&Method::POST, Some(&"txs"), Some(&"package"), None, None, None) => {
+            let txhexes: Vec<String> =
+                serde_json::from_str(String::from_utf8(body.to_vec())?.as_str())?;
+
+            if txhexes.len() > 25 {
+                Result::Err(HttpError::from(
+                    "Exceeded maximum of 25 transactions".to_string(),
+                ))?
+            }
+
+            let maxfeerate = query_params
+                .get("maxfeerate")
+                .map(|s| {
+                    s.parse::<f64>()
+                        .map_err(|_| HttpError::from("Invalid maxfeerate".to_string()))
+                })
+                .transpose()?;
+
+            let maxburnamount = query_params
+                .get("maxburnamount")
+                .map(|s| {
+                    s.parse::<f64>()
+                        .map_err(|_| HttpError::from("Invalid maxburnamount".to_string()))
+                })
+                .transpose()?;
+
+            // pre-checks
+            txhexes.iter().enumerate().try_for_each(|(index, txhex)| {
+                // each transaction must be of reasonable size
+                // (more than 60 bytes, within 400kWU standardness limit)
+                if !(120..800_000).contains(&txhex.len()) {
+                    Result::Err(HttpError::from(format!(
+                        "Invalid transaction size for item {}",
+                        index
+                    )))
+                } else {
+                    // must be a valid hex string
+                    HexToBytesIter::new(txhex)
+                        .map_err(|_| {
+                            HttpError::from(format!("Invalid transaction hex for item {}", index))
+                        })?
+                        .filter(|r| r.is_err())
+						.next()
+						.transpose()
+                        .map_err(|_| {
+                            HttpError::from(format!("Invalid transaction hex for item {}", index))
+                        })
+                        .map(|_| ())
+                }
+            })?;
+
+            let result = query
+                .submit_package(txhexes, maxfeerate, maxburnamount)
+                .map_err(|err| HttpError::from(err.description().to_string()))?;
+
+            json_response(result, TTL_SHORT)
         }
 
         (&Method::GET, Some(&"mempool"), None, None, None, None) => {
@@ -1154,6 +1224,7 @@ fn json_response<T: Serialize>(value: T, ttl: u32) -> Result<Response<Body>, Htt
         .unwrap())
 }
 
+#[trace]
 fn blocks(query: &Query, start_height: Option<usize>) -> Result<Response<Body>, HttpError> {
     let mut values = Vec::new();
     let mut current_hash = match start_height {
@@ -1264,12 +1335,6 @@ impl From<hex::HexToArrayError> for HttpError {
     fn from(_e: hex::HexToArrayError) -> Self {
         //HttpError::from(e.description().to_string())
         HttpError::from("Invalid hex string".to_string())
-    }
-}
-impl From<bitcoin::address::Error> for HttpError {
-    fn from(_e: bitcoin::address::Error) -> Self {
-        //HttpError::from(e.description().to_string())
-        HttpError::from("Invalid Bitcoin address".to_string())
     }
 }
 impl From<errors::Error> for HttpError {

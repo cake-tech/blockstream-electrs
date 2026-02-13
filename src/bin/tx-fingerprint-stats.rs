@@ -21,9 +21,10 @@ fn main() {
         util::has_prevout,
     };
 
-    let signal = Waiter::start();
+    let signal = Waiter::start(crossbeam_channel::never());
     let config = Config::from_args();
-    let store = Arc::new(Store::open(&config.db_path.join("newindex"), &config));
+    let metrics = Metrics::new(config.monitoring_addr);
+    let store = Arc::new(Store::open(&config, &metrics, true));
 
     let metrics = Metrics::new(config.monitoring_addr);
     metrics.start();
@@ -33,6 +34,7 @@ fn main() {
             &config.daemon_dir,
             &config.blocks_dir,
             config.daemon_rpc_addr,
+            config.daemon_parallelism,
             config.cookie_getter(),
             config.network_type,
             signal,
@@ -61,7 +63,7 @@ fn main() {
         }
 
         let tx: Transaction = deserialize(&value).expect("failed to parse Transaction");
-        let txid = tx.txid();
+        let txid = tx.compute_txid();
 
         iter.next();
 
@@ -82,13 +84,15 @@ fn main() {
 
         //info!("{:?},{:?}", txid, blockid);
 
-        let prevouts = chain.lookup_txos(
-            tx.input
-                .iter()
-                .filter(|txin| has_prevout(txin))
-                .map(|txin| txin.previous_output)
-                .collect(),
-        ).unwrap();
+        let prevouts = chain
+            .lookup_txos(
+                tx.input
+                    .iter()
+                    .filter(|txin| has_prevout(txin))
+                    .map(|txin| txin.previous_output)
+                    .collect(),
+            )
+            .unwrap();
 
         let total_out: u64 = tx.output.iter().map(|out| out.value.to_sat()).sum();
         let small_out = tx

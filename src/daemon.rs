@@ -1,21 +1,26 @@
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
-use std::env;
+use std::convert::TryFrom;
 use std::io::{BufRead, BufReader, Lines, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::{env, fs, io};
 
 use base64::prelude::{Engine, BASE64_STANDARD};
-use hex::FromHex;
-use itertools::Itertools;
+use bitcoin::hex::FromHex;
+use error_chain::ChainedError;
+use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use serde_json::{from_str, from_value, Value};
 
 #[cfg(not(feature = "liquid"))]
 use bitcoin::consensus::encode::{deserialize, serialize_hex};
 #[cfg(feature = "liquid")]
 use elements::encode::{deserialize, serialize_hex};
+
+use electrs_macros::trace;
 
 use crate::chain::{Block, BlockHash, BlockHeader, Network, Transaction, Txid};
 use crate::metrics::{HistogramOpts, HistogramVec, Metrics};
@@ -36,6 +41,10 @@ lazy_static! {
     );
 }
 
+const MAX_ATTEMPTS: u32 = 5;
+const RETRY_WAIT_DURATION: Duration = Duration::from_secs(1);
+
+#[trace]
 fn parse_hash<T>(value: &Value) -> Result<T>
 where
     T: FromStr,
@@ -49,6 +58,7 @@ where
     .chain_err(|| format!("non-hex value: {}", value))?)
 }
 
+#[trace]
 fn header_from_value(value: Value) -> Result<BlockHeader> {
     let header_hex = value
         .as_str()
@@ -79,13 +89,16 @@ fn parse_error_code(err: &Value) -> Option<i64> {
 
 fn parse_jsonrpc_reply(mut reply: Value, method: &str, expected_id: u64) -> Result<Value> {
     if let Some(reply_obj) = reply.as_object_mut() {
-        if let Some(err) = reply_obj.get("error") {
+        if let Some(err) = reply_obj.get_mut("error") {
             if !err.is_null() {
                 if let Some(code) = parse_error_code(&err) {
+                    let msg = err["message"]
+                        .as_str()
+                        .map_or_else(|| err.to_string(), |s| s.to_string());
                     match code {
                         // RPC_IN_WARMUP -> retry by later reconnection
                         -28 => bail!(ErrorKind::Connection(err.to_string())),
-                        _ => bail!("{} RPC error: {}", method, err),
+                        code => bail!(ErrorKind::RpcError(code, msg, method.to_string())),
                     }
                 }
             }
@@ -128,6 +141,34 @@ struct NetworkInfo {
     relayfee: f64, // in BTC/kB
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+struct MempoolFeesSubmitPackage {
+    base: f64,
+    #[serde(rename = "effective-feerate")]
+    effective_feerate: Option<f64>,
+    #[serde(rename = "effective-includes")]
+    effective_includes: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SubmitPackageResult {
+    package_msg: String,
+    #[serde(rename = "tx-results")]
+    tx_results: HashMap<String, TxResult>,
+    #[serde(rename = "replaced-transactions")]
+    replaced_transactions: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct TxResult {
+    txid: String,
+    #[serde(rename = "other-wtxid")]
+    other_wtxid: Option<String>,
+    vsize: Option<u32>,
+    fees: Option<MempoolFeesSubmitPackage>,
+    error: Option<String>,
+}
+
 pub trait CookieGetter: Send + Sync {
     fn get(&self) -> Result<Vec<u8>>;
 }
@@ -140,6 +181,7 @@ struct Connection {
     signal: Waiter,
 }
 
+#[trace]
 fn tcp_connect(addr: SocketAddr, signal: &Waiter) -> Result<TcpStream> {
     loop {
         match TcpStream::connect_timeout(&addr, *DAEMON_CONNECTION_TIMEOUT) {
@@ -162,6 +204,7 @@ fn tcp_connect(addr: SocketAddr, signal: &Waiter) -> Result<TcpStream> {
 }
 
 impl Connection {
+    #[trace]
     fn new(
         addr: SocketAddr,
         cookie_getter: Arc<dyn CookieGetter>,
@@ -181,10 +224,12 @@ impl Connection {
         })
     }
 
+    #[trace]
     fn reconnect(&self) -> Result<Connection> {
         Connection::new(self.addr, self.cookie_getter.clone(), self.signal.clone())
     }
 
+    #[trace]
     fn send(&mut self, request: &str) -> Result<()> {
         let cookie = &self.cookie_getter.get()?;
         let msg = format!(
@@ -198,6 +243,7 @@ impl Connection {
         })
     }
 
+    #[trace]
     fn recv(&mut self) -> Result<String> {
         // TODO: use proper HTTP parser.
         let mut in_header = true;
@@ -248,7 +294,7 @@ impl Connection {
         Ok(if status == "HTTP/1.1 200 OK" {
             contents
         } else if status == "HTTP/1.1 500 Internal Server Error" {
-            warn!("HTTP status: {}", status);
+            debug!("RPC HTTP 500 error: {}", contents);
             contents // the contents should have a JSONRPC error field
         } else {
             bail!(
@@ -287,6 +333,8 @@ pub struct Daemon {
     message_id: Counter, // for monotonic JSONRPC 'id'
     signal: Waiter,
 
+    rpc_threads: Arc<rayon::ThreadPool>,
+
     // monitoring
     latency: HistogramVec,
     size: HistogramVec,
@@ -297,6 +345,7 @@ impl Daemon {
         daemon_dir: &PathBuf,
         blocks_dir: &PathBuf,
         daemon_rpc_addr: SocketAddr,
+        daemon_parallelism: usize,
         cookie_getter: Arc<dyn CookieGetter>,
         network: Network,
         signal: Waiter,
@@ -313,6 +362,13 @@ impl Daemon {
             )?),
             message_id: Counter::new(),
             signal: signal.clone(),
+            rpc_threads: Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(daemon_parallelism)
+                    .thread_name(|i| format!("rpc-requests-{}", i))
+                    .build()
+                    .unwrap(),
+            ),
             latency: metrics.histogram_vec(
                 HistogramOpts::new("daemon_rpc", "Bitcoind RPC latency (in seconds)"),
                 &["method"],
@@ -353,6 +409,7 @@ impl Daemon {
         Ok(daemon)
     }
 
+    #[trace]
     pub fn reconnect(&self) -> Result<Daemon> {
         Ok(Daemon {
             daemon_dir: self.daemon_dir.clone(),
@@ -361,11 +418,13 @@ impl Daemon {
             conn: Mutex::new(self.conn.lock().unwrap().reconnect()?),
             message_id: Counter::new(),
             signal: self.signal.clone(),
+            rpc_threads: self.rpc_threads.clone(),
             latency: self.latency.clone(),
             size: self.size.clone(),
         })
     }
 
+    #[trace]
     pub fn list_blk_files(&self) -> Result<Vec<PathBuf>> {
         let path = self.blocks_dir.join("blk*.dat");
         debug!("listing block files at {:?}", path);
@@ -377,10 +436,31 @@ impl Daemon {
         Ok(paths)
     }
 
+    /// bitcoind v28.0+ defaults to xor-ing all blk*.dat files with this key,
+    /// stored in the blocks dir.
+    /// See: <https://github.com/bitcoin/bitcoin/pull/28052>
+    pub fn read_blk_file_xor_key(&self) -> Result<Option<[u8; 8]>> {
+        // From: <https://github.com/bitcoin/bitcoin/blob/v28.0/src/node/blockstorage.cpp#L1160>
+        let path = self.blocks_dir.join("xor.dat");
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err).chain_err(|| "failed to read daemon xor.dat file"),
+        };
+        let xor_key: [u8; 8] = <[u8; 8]>::try_from(bytes.as_slice()).chain_err(|| {
+            format!(
+                "xor.dat unexpected length: actual: {}, expected: 8",
+                bytes.len()
+            )
+        })?;
+        Ok(Some(xor_key))
+    }
+
     pub fn magic(&self) -> u32 {
         self.network.magic()
     }
 
+    #[trace]
     fn call_jsonrpc(&self, method: &str, request: &Value) -> Result<Value> {
         let mut conn = self.conn.lock().unwrap();
         let timer = self.latency.with_label_values(&[method]).start_timer();
@@ -398,33 +478,19 @@ impl Daemon {
         Ok(result)
     }
 
-    fn handle_request_batch(&self, method: &str, params_list: &[Value]) -> Result<Vec<Value>> {
+    #[trace(method = %method)]
+    fn handle_request(&self, method: &str, params: &Value) -> Result<Value> {
         let id = self.message_id.next();
-        let chunks = params_list
-            .iter()
-            .map(|params| json!({"method": method, "params": params, "id": id}))
-            .chunks(50_000); // Max Amount of batched requests
-        let mut results = vec![];
-        for chunk in &chunks {
-            let reqs = chunk.collect();
-            let mut replies = self.call_jsonrpc(method, &reqs)?;
-            if let Some(replies_vec) = replies.as_array_mut() {
-                for reply in replies_vec {
-                    results.push(parse_jsonrpc_reply(reply.take(), method, id)?)
-                }
-            } else {
-                bail!("non-array replies: {:?}", replies);
-            }
-        }
-
-        Ok(results)
+        let req = json!({"method": method, "params": params, "id": id});
+        let reply = self.call_jsonrpc(method, &req)?;
+        parse_jsonrpc_reply(reply, method, id)
     }
 
-    fn retry_request_batch(&self, method: &str, params_list: &[Value]) -> Result<Vec<Value>> {
+    fn retry_request(&self, method: &str, params: &Value) -> Result<Value> {
         loop {
-            match self.handle_request_batch(method, params_list) {
-                Err(Error(ErrorKind::Connection(msg), _)) => {
-                    warn!("reconnecting to bitcoind: {}", msg);
+            match self.handle_request(method, &params) {
+                Err(e @ Error(ErrorKind::Connection(_), _)) => {
+                    warn!("reconnecting to bitcoind: {}", e.display_chain());
                     self.signal.wait(Duration::from_secs(3), false)?;
                     let mut conn = self.conn.lock().unwrap();
                     *conn = conn.reconnect()?;
@@ -435,50 +501,94 @@ impl Daemon {
         }
     }
 
+    #[trace]
     fn request(&self, method: &str, params: Value) -> Result<Value> {
-        let mut values = self.retry_request_batch(method, &[params])?;
-        assert_eq!(values.len(), 1);
-        Ok(values.remove(0))
+        self.retry_request(method, &params)
     }
 
-    fn requests(&self, method: &str, params_list: &[Value]) -> Result<Vec<Value>> {
-        self.retry_request_batch(method, params_list)
+    #[trace]
+    fn retry_reconnect(&self) -> Daemon {
+        // XXX add a max reconnection attempts limit?
+        loop {
+            match self.reconnect() {
+                Ok(daemon) => break daemon,
+                Err(e) => {
+                    warn!("failed connecting to RPC daemon: {}", e.display_chain());
+                }
+            }
+        }
+    }
+
+    // Send requests in parallel over multiple RPC connections as individual JSON-RPC requests (with no JSON-RPC batching),
+    // buffering the replies into a vector. If any of the requests fail, processing is terminated and an Err is returned.
+    #[trace]
+    fn requests(&self, method: &str, params_list: Vec<Value>) -> Result<Vec<Value>> {
+        self.requests_iter(method, params_list).collect()
+    }
+
+    // Send requests in parallel over multiple RPC connections, iterating over the results without buffering them.
+    // Errors are included in the iterator and do not terminate other pending requests.
+    #[trace]
+    fn requests_iter<'a>(
+        &'a self,
+        method: &'a str,
+        params_list: Vec<Value>,
+    ) -> impl ParallelIterator<Item = Result<Value>> + IndexedParallelIterator + 'a {
+        self.rpc_threads.install(move || {
+            params_list.into_par_iter().map(move |params| {
+                // Store a local per-thread Daemon, each with its own TCP connection. These will
+                // get initialized as necessary for the `rpc_threads` pool thread managed by rayon.
+                thread_local!(static DAEMON_INSTANCE: OnceCell<Daemon> = OnceCell::new());
+
+                DAEMON_INSTANCE.with(|daemon| {
+                    daemon
+                        .get_or_init(|| self.retry_reconnect())
+                        .retry_request(&method, &params)
+                })
+            })
+        })
     }
 
     // bitcoind JSONRPC API:
 
+    #[trace]
     pub fn getblockchaininfo(&self) -> Result<BlockchainInfo> {
         let info: Value = self.request("getblockchaininfo", json!([]))?;
         Ok(from_value(info).chain_err(|| "invalid blockchain info")?)
     }
 
+    #[trace]
     fn getnetworkinfo(&self) -> Result<NetworkInfo> {
         let info: Value = self.request("getnetworkinfo", json!([]))?;
         Ok(from_value(info).chain_err(|| "invalid network info")?)
     }
 
+    #[trace]
     pub fn getbestblockhash(&self) -> Result<BlockHash> {
         parse_hash(&self.request("getbestblockhash", json!([]))?)
     }
 
+    #[trace]
     pub fn getblockheader(&self, blockhash: &BlockHash) -> Result<BlockHeader> {
         header_from_value(self.request("getblockheader", json!([blockhash, /*verbose=*/ false]))?)
     }
 
+    #[trace]
     pub fn getblockheaders(&self, heights: &[usize]) -> Result<Vec<BlockHeader>> {
         let heights: Vec<Value> = heights.iter().map(|height| json!([height])).collect();
         let params_list: Vec<Value> = self
-            .requests("getblockhash", &heights)?
+            .requests("getblockhash", heights)?
             .into_iter()
             .map(|hash| json!([hash, /*verbose=*/ false]))
             .collect();
         let mut result = vec![];
-        for h in self.requests("getblockheader", &params_list)? {
+        for h in self.requests("getblockheader", params_list)? {
             result.push(header_from_value(h)?);
         }
         Ok(result)
     }
 
+    #[trace]
     pub fn getblock(&self, blockhash: &BlockHash) -> Result<Block> {
         let block =
             block_from_value(self.request("getblock", json!([blockhash, /*verbose=*/ false]))?)?;
@@ -486,16 +596,39 @@ impl Daemon {
         Ok(block)
     }
 
+    #[trace]
     pub fn getblock_raw(&self, blockhash: &BlockHash, verbose: u32) -> Result<Value> {
         self.request("getblock", json!([blockhash, verbose]))
     }
 
+    #[trace]
     pub fn getblocks(&self, blockhashes: &[BlockHash]) -> Result<Vec<Block>> {
         let params_list: Vec<Value> = blockhashes
             .iter()
             .map(|hash| json!([hash, /*verbose=*/ false]))
             .collect();
-        let values = self.requests("getblock", &params_list)?;
+
+        let mut attempts = MAX_ATTEMPTS;
+        let values = loop {
+            attempts -= 1;
+
+            match self.requests("getblock", params_list.clone()) {
+                Ok(blocks) => break blocks,
+                Err(e) => {
+                    let err_msg = format!("{e:?}");
+                    if err_msg.contains("Block not found on disk") {
+                        // There is a small chance the node returns the header but didn't finish to index the block
+                        log::warn!("getblocks failing with: {e:?} trying {attempts} more time")
+                    } else {
+                        panic!("failed to get blocks from bitcoind: {}", err_msg);
+                    }
+                }
+            }
+            if attempts == 0 {
+                panic!("failed to get blocks from bitcoind")
+            }
+            std::thread::sleep(RETRY_WAIT_DURATION);
+        };
         let mut blocks = vec![];
         for value in values {
             blocks.push(block_from_value(value)?);
@@ -503,21 +636,34 @@ impl Daemon {
         Ok(blocks)
     }
 
-    pub fn gettransactions(&self, txhashes: &[&Txid]) -> Result<Vec<Transaction>> {
-        let params_list: Vec<Value> = txhashes
+    /// Fetch the given transactions in parallel over multiple threads and RPC connections,
+    /// ignoring any missing ones and returning whatever is available.
+    #[trace]
+    pub fn gettransactions_available(&self, txids: &[&Txid]) -> Result<HashMap<Txid, Transaction>> {
+        const RPC_INVALID_ADDRESS_OR_KEY: i64 = -5;
+
+        let params_list: Vec<Value> = txids
             .iter()
             .map(|txhash| json!([txhash, /*verbose=*/ false]))
             .collect();
 
-        let values = self.requests("getrawtransaction", &params_list)?;
-        let mut txs = vec![];
-        for value in values {
-            txs.push(tx_from_value(value)?);
-        }
-        assert_eq!(txhashes.len(), txs.len());
-        Ok(txs)
+        self.requests_iter("getrawtransaction", params_list)
+            .zip(txids)
+            .filter_map(|(res, txid)| match res {
+                Ok(val) => Some(tx_from_value(val).map(|tx| (**txid, tx))),
+                // Ignore 'tx not found' errors
+                Err(Error(ErrorKind::RpcError(code, _, _), _))
+                    if code == RPC_INVALID_ADDRESS_OR_KEY =>
+                {
+                    None
+                }
+                // Terminate iteration if any other errors are encountered
+                Err(e) => Some(Err(e)),
+            })
+            .collect()
     }
 
+    #[trace]
     pub fn gettransaction_raw(
         &self,
         txid: &Txid,
@@ -528,20 +674,24 @@ impl Daemon {
         self.request("getrawtransaction", json!([txid, verbose, blockhash]))
     }
 
+    #[trace]
     pub fn getmempooltx(&self, txhash: &Txid) -> Result<Transaction> {
         let value = self.request("getrawtransaction", json!([txhash, /*verbose=*/ false]))?;
         tx_from_value(value)
     }
 
+    #[trace]
     pub fn getmempooltxids(&self) -> Result<HashSet<Txid>> {
         let res = self.request("getrawmempool", json!([/*verbose=*/ false]))?;
         Ok(serde_json::from_value(res).chain_err(|| "invalid getrawmempool reply")?)
     }
 
+    #[trace]
     pub fn broadcast(&self, tx: &Transaction) -> Result<Txid> {
         self.broadcast_raw(&serialize_hex(tx))
     }
 
+    #[trace]
     pub fn broadcast_raw(&self, txhex: &str) -> Result<Txid> {
         let txid = self.request("sendrawtransaction", json!([txhex]))?;
         Ok(
@@ -550,9 +700,29 @@ impl Daemon {
         )
     }
 
+    pub fn submit_package(
+        &self,
+        txhex: Vec<String>,
+        maxfeerate: Option<f64>,
+        maxburnamount: Option<f64>,
+    ) -> Result<SubmitPackageResult> {
+        let params = match (maxfeerate, maxburnamount) {
+            (Some(rate), Some(burn)) => {
+                json!([txhex, format!("{:.8}", rate), format!("{:.8}", burn)])
+            }
+            (Some(rate), None) => json!([txhex, format!("{:.8}", rate)]),
+            (None, Some(burn)) => json!([txhex, null, format!("{:.8}", burn)]),
+            (None, None) => json!([txhex]),
+        };
+        let result = self.request("submitpackage", params)?;
+        serde_json::from_value::<SubmitPackageResult>(result)
+            .chain_err(|| "invalid submitpackage reply")
+    }
+
     // Get estimated feerates for the provided confirmation targets using a batch RPC request
     // Missing estimates are logged but do not cause a failure, whatever is available is returned
     #[allow(clippy::float_cmp)]
+    #[trace]
     pub fn estimatesmartfee_batch(&self, conf_targets: &[u16]) -> Result<HashMap<u16, f64>> {
         let params_list: Vec<Value> = conf_targets
             .iter()
@@ -560,7 +730,7 @@ impl Daemon {
             .collect();
 
         Ok(self
-            .requests("estimatesmartfee", &params_list)?
+            .requests("estimatesmartfee", params_list)?
             .iter()
             .zip(conf_targets)
             .filter_map(|(reply, target)| {
@@ -587,6 +757,7 @@ impl Daemon {
             .collect())
     }
 
+    #[trace]
     fn get_all_headers(&self, tip: &BlockHash) -> Result<Vec<BlockHeader>> {
         let info: Value = self.request("getblockheader", json!([tip]))?;
         let tip_height = info
@@ -598,10 +769,16 @@ impl Daemon {
         let chunk_size = 100_000;
         let mut result = vec![];
         for heights in all_heights.chunks(chunk_size) {
-            trace!("downloading {} block headers", heights.len());
             let mut headers = self.getblockheaders(&heights)?;
             assert!(headers.len() == heights.len());
+
             result.append(&mut headers);
+
+            info!("downloaded {}/{} block headers ({:.0}%)",
+                result.len(),
+                tip_height,
+                result.len() as f32 / tip_height as f32 * 100.0);
+
         }
 
         let mut blockhash = *DEFAULT_BLOCKHASH;
@@ -614,6 +791,7 @@ impl Daemon {
     }
 
     // Returns a list of BlockHeaders in ascending height (i.e. the tip is last).
+    #[trace]
     pub fn get_new_headers(
         &self,
         indexed_headers: &HeaderList,
@@ -621,7 +799,7 @@ impl Daemon {
     ) -> Result<Vec<BlockHeader>> {
         // Iterate back over headers until known blockash is found:
         if indexed_headers.is_empty() {
-            debug!("downloading all block headers up to {}", bestblockhash);
+            info!("downloading all block headers up to {}", bestblockhash);
             return self.get_all_headers(bestblockhash);
         }
         debug!(
@@ -646,6 +824,7 @@ impl Daemon {
         Ok(new_headers)
     }
 
+    #[trace]
     pub fn get_relayfee(&self) -> Result<f64> {
         let relayfee = self.getnetworkinfo()?.relayfee;
 

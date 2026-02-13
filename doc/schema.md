@@ -26,17 +26,16 @@ Each block results in the following new rows:
 
  * `"M{blockhash}" → "{metadata}"` (block weight, size and number of txs)
 
- * `"D{blockhash}" → ""` (signifies the block is done processing)
+ * `"D{blockhash}" → ""` (signifies the block was added)
 
-Each transaction results in the following new rows:
+Each transaction results in the following new row:
 
  * `"T{txid}" → "{serialized-transaction}"`
 
- * `"C{txid}{confirmed-blockhash}" → ""` (a list of blockhashes where `txid` was seen to be confirmed)
-
-Each output results in the following new row:
+Each output results in the following new rows:
 
  * `"O{txid}{vout}" → "{scriptpubkey}{value}"`
+ * `"a{funding-address-str}" → ""` (for prefix address search, only saved when `--address-search` is enabled)
 
 When the indexer is synced up to the tip of the chain, the hash of the tip is saved as following:
 
@@ -44,16 +43,23 @@ When the indexer is synced up to the tip of the chain, the hash of the tip is sa
 
 ### `history`
 
-Each funding output (except for provably unspendable ones when `--index-unspendables` is not enabled) results in the following new rows (`H` is for history, `F` is for funding):
+Each transaction results in the following new row:
+
+ * `"C{txid}" → "{confirmed-height}"`
+
+Each funding output (except for provably unspendable ones when `--index-unspendables` is not enabled) results in the following new row (`H` is for history, `F` is for funding):
 
  * `"H{funding-scripthash}{funding-height}F{funding-txid:vout}{value}" → ""`
- * `"a{funding-address-str}" → ""` (for prefix address search, only saved when `--address-search` is enabled)
 
 Each spending input (except the coinbase) results in the following new rows (`S` is for spending):
 
  * `"H{funding-scripthash}{spending-height}S{spending-txid:vin}{funding-txid:vout}{value}" → ""`
 
- * `"S{funding-txid:vout}{spending-txid:vin}" → ""`
+ * `"S{funding-txid:vout}" → "{spending-txid:vin}{spending-height}"`
+
+Each block results in the following new row:
+
+ * `"D{blockhash}" → ""` (signifies the block was indexed)
 
 #### Silent Payments only
 

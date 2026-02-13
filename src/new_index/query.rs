@@ -1,5 +1,3 @@
-use rayon::prelude::*;
-
 use std::collections::{BTreeSet, HashMap};
 use std::convert::TryInto;
 use std::sync::{Arc, RwLock, RwLockReadGuard};
@@ -7,15 +5,17 @@ use std::time::{Duration, Instant};
 
 use crate::chain::{Network, OutPoint, Transaction, TxOut, Txid};
 use crate::config::Config;
-use crate::daemon::Daemon;
+use crate::daemon::{Daemon, SubmitPackageResult};
 use crate::errors::*;
 use crate::new_index::{ChainQuery, Mempool, ScriptStats, SpendingInput, Utxo};
 use crate::util::{is_spendable, BlockId, Bytes, TransactionStatus};
 
+use electrs_macros::trace;
+
 #[cfg(feature = "liquid")]
 use crate::{
     chain::AssetId,
-    elements::{lookup_asset, AssetRegistry, AssetSorting, LiquidAsset},
+    elements::{ebcompact::TxidCompat, lookup_asset, AssetRegistry, AssetSorting, LiquidAsset},
 };
 
 use super::db::{ReverseScanIterator, ScanIterator};
@@ -81,15 +81,28 @@ impl Query {
         self.mempool.read().unwrap()
     }
 
+    #[trace]
     pub fn broadcast_raw(&self, txhex: &str) -> Result<Txid> {
         let txid = self.daemon.broadcast_raw(txhex)?;
-        self.mempool
+        let _ = self
+            .mempool
             .write()
             .unwrap()
-            .add_by_txid(&self.daemon, &txid);
+            .add_by_txid(&self.daemon, txid);
         Ok(txid)
     }
 
+    #[trace]
+    pub fn submit_package(
+        &self,
+        txhex: Vec<String>,
+        maxfeerate: Option<f64>,
+        maxburnamount: Option<f64>,
+    ) -> Result<SubmitPackageResult> {
+        self.daemon.submit_package(txhex, maxfeerate, maxburnamount)
+    }
+
+    #[trace]
     pub fn utxo(&self, scripthash: &[u8]) -> Result<Vec<Utxo>> {
         let mut utxos = self.chain.utxo(scripthash, self.config.utxos_limit)?;
         let mempool = self.mempool();
@@ -98,6 +111,7 @@ impl Query {
         Ok(utxos)
     }
 
+    #[trace]
     pub fn history_txids(&self, scripthash: &[u8], limit: usize) -> Vec<(Txid, Option<BlockId>)> {
         let confirmed_txids = self.chain.history_txids(scripthash, limit);
         let confirmed_len = confirmed_txids.len();
@@ -132,17 +146,21 @@ impl Query {
         )
     }
 
+    #[trace]
     pub fn lookup_txn(&self, txid: &Txid) -> Option<Transaction> {
         self.chain
             .lookup_txn(txid, None)
             .or_else(|| self.mempool().lookup_txn(txid))
     }
+
+    #[trace]
     pub fn lookup_raw_txn(&self, txid: &Txid) -> Option<Bytes> {
         self.chain
             .lookup_raw_txn(txid, None)
             .or_else(|| self.mempool().lookup_raw_txn(txid))
     }
 
+    #[trace]
     pub fn lookup_txos(&self, outpoints: BTreeSet<OutPoint>) -> HashMap<OutPoint, TxOut> {
         // the mempool lookup_txos() internally looks up confirmed txos as well
         self.mempool()
@@ -150,24 +168,37 @@ impl Query {
             .expect("failed loading txos")
     }
 
+    #[trace]
     pub fn lookup_spend(&self, outpoint: &OutPoint) -> Option<SpendingInput> {
         self.chain
             .lookup_spend(outpoint)
             .or_else(|| self.mempool().lookup_spend(outpoint))
     }
 
-    pub fn lookup_tx_spends(&self, tx: Transaction) -> Vec<Option<SpendingInput>> {
-        let txid = tx.txid();
+    #[trace]
+    pub fn lookup_tx_spends(&self, tx: &Transaction) -> Vec<Option<SpendingInput>> {
+        let txid = tx.compute_txid();
+        let outpoints = tx
+            .output
+            .iter()
+            .enumerate()
+            .filter(|(_, txout)| is_spendable(txout))
+            .map(|(vout, _)| OutPoint::new(txid, vout as u32))
+            .collect::<BTreeSet<_>>();
 
+        // First fetch all confirmed spends using a MultiGet operation,
+        // then fall back to the mempool for any outpoints not spent on-chain
+        let mut chain_spends = self.chain.lookup_spends(outpoints);
+        let mempool = self.mempool();
         tx.output
-            .par_iter()
+            .iter()
             .enumerate()
             .map(|(vout, txout)| {
                 if is_spendable(txout) {
-                    self.lookup_spend(&OutPoint {
-                        txid,
-                        vout: vout as u32,
-                    })
+                    let outpoint = OutPoint::new(txid, vout as u32);
+                    chain_spends
+                        .remove(&outpoint)
+                        .or_else(|| mempool.lookup_spend(&outpoint))
                 } else {
                     None
                 }
@@ -175,18 +206,22 @@ impl Query {
             .collect()
     }
 
+    #[trace]
     pub fn get_tx_status(&self, txid: &Txid) -> TransactionStatus {
         TransactionStatus::from(self.chain.tx_confirming_block(txid))
     }
 
+    #[trace]
     pub fn get_mempool_tx_fee(&self, txid: &Txid) -> Option<u64> {
         self.mempool().get_tx_fee(txid)
     }
 
+    #[trace]
     pub fn has_unconfirmed_parents(&self, txid: &Txid) -> bool {
         self.mempool().has_unconfirmed_parents(txid)
     }
 
+    #[trace]
     pub fn estimate_fee(&self, conf_target: u16) -> Option<f64> {
         if self.config.network_type.is_regtest() {
             return self.get_relayfee().ok();
@@ -206,6 +241,7 @@ impl Query {
             .copied()
     }
 
+    #[trace]
     pub fn estimate_fee_map(&self) -> HashMap<u16, f64> {
         if let (ref cache, Some(cache_time)) = *self.cached_estimates.read().unwrap() {
             if cache_time.elapsed() < Duration::from_secs(FEE_ESTIMATES_TTL) {
@@ -217,6 +253,7 @@ impl Query {
         self.cached_estimates.read().unwrap().0.clone()
     }
 
+    #[trace]
     fn update_fee_estimates(&self) {
         match self.daemon.estimatesmartfee_batch(&CONF_TARGETS) {
             Ok(estimates) => {
@@ -228,6 +265,7 @@ impl Query {
         }
     }
 
+    #[trace]
     pub fn get_relayfee(&self) -> Result<f64> {
         if let Some(cached) = *self.cached_relayfee.read().unwrap() {
             return Ok(cached);
@@ -258,11 +296,13 @@ impl Query {
     }
 
     #[cfg(feature = "liquid")]
+    #[trace]
     pub fn lookup_asset(&self, asset_id: &AssetId) -> Result<Option<LiquidAsset>> {
         lookup_asset(&self, self.asset_db.as_ref(), asset_id, None)
     }
 
     #[cfg(feature = "liquid")]
+    #[trace]
     pub fn list_registry_assets(
         &self,
         start_index: usize,

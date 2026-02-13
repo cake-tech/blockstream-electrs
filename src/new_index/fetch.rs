@@ -14,6 +14,8 @@ use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 use std::thread;
 
+use electrs_macros::trace;
+
 use crate::chain::{Block, BlockHash};
 use crate::daemon::Daemon;
 use crate::errors::*;
@@ -26,6 +28,7 @@ pub enum FetchFrom {
     BlkFilesReverse,
 }
 
+#[trace]
 pub fn start_fetcher(
     from: FetchFrom,
     daemon: &Daemon,
@@ -69,6 +72,7 @@ impl<T> Fetcher<T> {
     }
 }
 
+#[trace]
 fn bitcoind_fetcher(
     daemon: &Daemon,
     new_headers: Vec<HeaderEntry>,
@@ -82,7 +86,20 @@ fn bitcoind_fetcher(
     Ok(Fetcher::from(
         chan.into_receiver(),
         spawn_thread("bitcoind_fetcher", move || {
+            let mut fetcher_count = 0;
+            let mut blocks_fetched = 0;
+            let total_blocks_fetched = new_headers.len();
             for entries in new_headers.chunks(100) {
+                if fetcher_count % 50 == 0 && total_blocks_fetched >= 50 {
+                    info!("fetching blocks {}/{} ({:.1}%)",
+                        blocks_fetched,
+                        total_blocks_fetched,
+                        blocks_fetched as f32 / total_blocks_fetched as f32 * 100.0
+                    );
+                }
+                fetcher_count += 1;
+                blocks_fetched += entries.len();
+
                 let blockhashes: Vec<BlockHash> = entries.iter().map(|e| *e.hash()).collect();
                 let blocks = daemon
                     .getblocks(&blockhashes)
@@ -101,11 +118,13 @@ fn bitcoind_fetcher(
                 sender
                     .send(block_entries)
                     .expect("failed to send fetched blocks");
+                log::debug!("last fetch {:?}", entries.last());
             }
         }),
     ))
 }
 
+#[trace]
 fn blkfiles_fetcher_normal(
     daemon: &Daemon,
     new_headers: Vec<HeaderEntry>,
@@ -130,6 +149,7 @@ fn blkfiles_fetcher(
     if reverse {
         blk_files.reverse();
     }
+    let xor_key = daemon.read_blk_file_xor_key()?;
 
     let chan = SyncChannel::new(1);
     let sender = chan.sender();
@@ -137,38 +157,37 @@ fn blkfiles_fetcher(
     let mut entry_map: HashMap<BlockHash, HeaderEntry> =
         new_headers.into_iter().map(|h| (*h.hash(), h)).collect();
 
-    let parser = blkfiles_parser(blkfiles_reader(blk_files), magic);
+    let parser = blkfiles_parser(blkfiles_reader(blk_files, xor_key), magic);
     Ok(Fetcher::from(
         chan.into_receiver(),
         spawn_thread("blkfiles_fetcher", move || {
-            for sizedblocks in parser.receiver {
-                let mut block_entries: Vec<BlockEntry> = vec![];
-
-                for (block, size) in &sizedblocks {
-                    let blockhash = block.block_hash();
-
-                    match entry_map.remove(&blockhash).map(|entry| BlockEntry {
-                        block: block.clone(),
-                        entry,
-                        size: size.clone(),
-                    }) {
-                        Some(entry) => block_entries.push(entry),
-                        None => {
-                            trace!("skipping block {}", blockhash);
-                            break;
-                        }
-                    };
-                }
-
-                if entry_map.is_empty() {
-                    break;
-                }
-
+            parser.map(|sizedblocks| {
+                let block_count = sizedblocks.len();
+                let mut index = 0;
+                let block_entries: Vec<BlockEntry> = sizedblocks
+                    .into_iter()
+                    .filter_map(|(block, size)| {
+                        index += 1;
+                        debug!("fetch block {:}/{:} {:.2}%",
+                            index,
+                            block_count,
+                            (index/block_count) as f32/100.0
+                        );
+                        let blockhash = block.block_hash();
+                        entry_map
+                            .remove(&blockhash)
+                            .map(|entry| BlockEntry { block, entry, size })
+                            .or_else(|| {
+                                trace!("skipping block {}", blockhash);
+                                None
+                            })
+                    })
+                    .collect();
                 trace!("fetched {} blocks", block_entries.len());
                 sender
                     .send(block_entries)
                     .expect("failed to send blocks entries from blk*.dat files");
-            }
+            })
 
             if !entry_map.is_empty() {
                 panic!(
@@ -180,17 +199,28 @@ fn blkfiles_fetcher(
     ))
 }
 
-fn blkfiles_reader(blk_files: Vec<PathBuf>) -> Fetcher<Vec<u8>> {
+#[trace]
+fn blkfiles_reader(blk_files: Vec<PathBuf>, xor_key: Option<[u8; 8]>) -> Fetcher<Vec<u8>> {
     let chan = SyncChannel::new(1);
     let sender = chan.sender();
 
     Fetcher::from(
         chan.into_receiver(),
         spawn_thread("blkfiles_reader", move || {
-            for path in blk_files {
+            let blk_files_len = blk_files.len();
+            for (count, path) in blk_files.iter().enumerate() {
+                info!("block file reading {:}/{:} {:.2}%",
+                    count,
+                    blk_files_len,
+                    count / blk_files_len
+                );
+
                 trace!("reading {:?}", path);
-                let blob = fs::read(&path)
+                let mut blob = fs::read(&path)
                     .unwrap_or_else(|e| panic!("failed to read {:?}: {:?}", path, e));
+                if let Some(xor_key) = xor_key {
+                    blkfile_apply_xor_key(xor_key, &mut blob);
+                }
                 sender
                     .send(blob)
                     .unwrap_or_else(|_| panic!("failed to send {:?} contents", path));
@@ -199,6 +229,15 @@ fn blkfiles_reader(blk_files: Vec<PathBuf>) -> Fetcher<Vec<u8>> {
     )
 }
 
+/// By default, bitcoind v28.0+ applies an 8-byte "xor key" over each "blk*.dat"
+/// file. We have xor again to undo this transformation.
+fn blkfile_apply_xor_key(xor_key: [u8; 8], blob: &mut [u8]) {
+    for (i, blob_i) in blob.iter_mut().enumerate() {
+        *blob_i ^= xor_key[i & 0x7];
+    }
+}
+
+#[trace]
 fn blkfiles_parser(blobs: Fetcher<Vec<u8>>, magic: u32) -> Fetcher<Vec<SizedBlock>> {
     let chan = SyncChannel::new(1);
     let sender = chan.sender();
@@ -217,6 +256,7 @@ fn blkfiles_parser(blobs: Fetcher<Vec<u8>>, magic: u32) -> Fetcher<Vec<SizedBloc
     )
 }
 
+#[trace]
 fn parse_blocks(blob: Vec<u8>, magic: u32) -> Result<Vec<SizedBlock>> {
     let mut cursor = Cursor::new(&blob);
     let mut slices = vec![];

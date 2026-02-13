@@ -13,7 +13,7 @@ use crate::elements::registry::{AssetMeta, AssetRegistry};
 use crate::errors::*;
 use crate::new_index::schema::{TxHistoryInfo, TxHistoryKey, TxHistoryRow};
 use crate::new_index::{db::DBFlush, ChainQuery, DBRow, Mempool, Query};
-use crate::util::{bincode, full_hash, Bytes, FullHash, TransactionStatus, TxInput};
+use crate::util::{bincode, full_hash, BlockId, Bytes, FullHash, TransactionStatus, TxInput};
 
 lazy_static! {
     pub static ref NATIVE_ASSET_ID: AssetId =
@@ -509,7 +509,7 @@ where
 
     // save updated stats to cache
     if let Some(lastblock) = lastblock {
-        chain.store().cache_db().write(
+        chain.store().cache_db().write_rows(
             vec![asset_cache_row(asset_id, &newstats, &lastblock)],
             DBFlush::Enable,
         );
@@ -526,13 +526,14 @@ fn chain_asset_stats_delta<T>(
     start_height: usize,
     apply_fn: AssetStatApplyFn<T>,
 ) -> (T, Option<BlockHash>) {
+    let headers = chain.store().headers();
     let history_iter = chain
         .history_iter_scan(b'I', &asset_id.into_inner()[..], start_height)
         .map(TxHistoryRow::from_row)
         .filter_map(|history| {
-            chain
-                .tx_confirming_block(&history.get_txid())
-                .map(|blockid| (history, blockid))
+            // skip over entries that point to non-existing heights (may happen while new/reorged blocks are being processed)
+            let header = headers.header_by_height(history.key.confirmed_height as usize)?;
+            Some((history, BlockId::from(header)))
         });
 
     let mut stats = init_stats;

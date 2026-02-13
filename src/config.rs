@@ -25,6 +25,7 @@ pub struct Config {
     pub daemon_dir: PathBuf,
     pub blocks_dir: PathBuf,
     pub daemon_rpc_addr: SocketAddr,
+    pub daemon_parallelism: usize,
     pub cookie: Option<String>,
     pub electrum_rpc_addr: SocketAddr,
     pub http_addr: SocketAddr,
@@ -39,7 +40,32 @@ pub struct Config {
     pub utxos_limit: usize,
     pub electrum_txs_limit: usize,
     pub electrum_banner: String,
-    pub electrum_rpc_logging: Option<RpcLogging>,
+    pub rpc_logging: RpcLogging,
+    pub zmq_addr: Option<SocketAddr>,
+
+    /// Enable compaction during initial sync
+    ///
+    /// By default compaction is off until initial sync is finished for performance reasons,
+    /// however, this requires much more disk space.
+    pub initial_sync_compaction: bool,
+
+    /// RocksDB block cache size in MB (per database)
+    /// Caches decompressed blocks in memory to avoid repeated decompression (CPU intensive)
+    /// Total memory usage = cache_size * 3_databases (txstore, history, cache)
+    /// Recommendation: Start with 1024MB for production
+    /// Higher values reduce CPU load from cache misses but use more RAM
+    pub db_block_cache_mb: usize,
+
+    /// RocksDB parallelism level (background compaction and flush threads)
+    /// Recommendation: Set to number of CPU cores for optimal performance
+    /// This configures max_background_jobs and thread pools automatically
+    pub db_parallelism: usize,
+
+    /// RocksDB write buffer size in MB (per database)
+    /// Each database uses this much RAM for in-memory writes before flushing to disk
+    /// Total RAM usage = write_buffer_size * max_write_buffer_number * 3_databases
+    /// Larger buffers = fewer flushes (less CPU) but more RAM usage
+    pub db_write_buffer_size_mb: usize,
 
     #[cfg(feature = "liquid")]
     pub parent_network: BNetwork,
@@ -72,10 +98,6 @@ fn str_to_socketaddr(address: &str, what: &str) -> SocketAddr {
 impl Config {
     pub fn from_args() -> Config {
         let network_help = format!("Select network type ({})", Network::names().join(", "));
-        let rpc_logging_help = format!(
-            "Select RPC logging option ({})",
-            RpcLogging::options().join(", ")
-        );
 
         let args = App::new("Electrum Rust Server")
             .version(crate_version!())
@@ -123,25 +145,31 @@ impl Config {
             .arg(
                 Arg::with_name("electrum_rpc_addr")
                     .long("electrum-rpc-addr")
-                    .help("Electrum server JSONRPC 'addr:port' to listen on (default: '127.0.0.1:50001' for mainnet, '127.0.0.1:60001' for testnet and '127.0.0.1:60401' for regtest)")
+                    .help("Electrum server JSONRPC 'addr:port' to listen on (default: '127.0.0.1:50001' for mainnet, '127.0.0.1:60001' for testnet3, '127.0.0.1:40001' for testnet4 and '127.0.0.1:60401' for regtest)")
                     .takes_value(true),
             )
             .arg(
                 Arg::with_name("http_addr")
                     .long("http-addr")
-                    .help("HTTP server 'addr:port' to listen on (default: '127.0.0.1:3000' for mainnet, '127.0.0.1:3001' for testnet and '127.0.0.1:3002' for regtest)")
+                    .help("HTTP server 'addr:port' to listen on (default: '127.0.0.1:3000' for mainnet, '127.0.0.1:3001' for testnet3 and '127.0.0.1:3004' for testnet4 and '127.0.0.1:3002' for regtest)")
                     .takes_value(true),
             )
             .arg(
                 Arg::with_name("daemon_rpc_addr")
                     .long("daemon-rpc-addr")
-                    .help("Bitcoin daemon JSONRPC 'addr:port' to connect (default: 127.0.0.1:8332 for mainnet, 127.0.0.1:18332 for testnet and 127.0.0.1:18443 for regtest)")
+                    .help("Bitcoin daemon JSONRPC 'addr:port' to connect (default: 127.0.0.1:8332 for mainnet, 127.0.0.1:18332 for testnet3 and 127.0.0.1:48332 for testnet4 and 127.0.0.1:18443 for regtest)")
                     .takes_value(true),
+            )
+            .arg(
+                Arg::with_name("daemon_parallelism")
+                    .long("daemon-parallelism")
+                    .help("Number of JSONRPC requests to send in parallel")
+                    .default_value("4")
             )
             .arg(
                 Arg::with_name("monitoring_addr")
                     .long("monitoring-addr")
-                    .help("Prometheus monitoring 'addr:port' to listen on (default: 127.0.0.1:4224 for mainnet, 127.0.0.1:14224 for testnet and 127.0.0.1:24224 for regtest)")
+                    .help("Prometheus monitoring 'addr:port' to listen on (default: 127.0.0.1:4224 for mainnet, 127.0.0.1:14224 for testnet3 and 127.0.0.1:44224 for testnet4 and 127.0.0.1:24224 for regtest)")
                     .takes_value(true),
             )
             .arg(
@@ -193,9 +221,46 @@ impl Config {
                     .help("Welcome banner for the Electrum server, shown in the console to clients.")
                     .takes_value(true)
             ).arg(
-                Arg::with_name("electrum_rpc_logging")
-                    .long("electrum-rpc-logging")
-                    .help(&rpc_logging_help)
+                Arg::with_name("enable_json_rpc_logging")
+                    .long("enable-json-rpc-logging")
+                    .help("turns on rpc logging")
+                    .takes_value(false)
+            ).arg(
+                Arg::with_name("hide_json_rpc_logging_parameters")
+                    .long("hide-json-rpc-logging-parameters")
+                    .help("disables parameter printing in rpc logs")
+                    .takes_value(false)
+            ).arg(
+                Arg::with_name("anonymize_json_rpc_logging_source_ip")
+                    .long("anonymize-json-rpc-logging-source-ip")
+                    .help("enables ip anonymization in rpc logs")
+                    .takes_value(false)
+            ).arg(
+                Arg::with_name("initial_sync_compaction")
+                    .long("initial-sync-compaction")
+                    .help("Perform compaction during initial sync (slower but less disk space required)")
+            ).arg(
+                Arg::with_name("db_block_cache_mb")
+                    .long("db-block-cache-mb")
+                    .help("RocksDB block cache size in MB per database")
+                    .takes_value(true)
+                    .default_value("8")
+            ).arg(
+                Arg::with_name("db_parallelism")
+                    .long("db-parallelism")
+                    .help("RocksDB parallelism level. Set to number of CPU cores for optimal performance")
+                    .takes_value(true)
+                    .default_value("2")
+            ).arg(
+                Arg::with_name("db_write_buffer_size_mb")
+                    .long("db-write-buffer-size-mb")
+                    .help("RocksDB write buffer size in MB per database. RAM usage = size * max_write_buffers(2) * 3_databases")
+                    .takes_value(true)
+                    .default_value("256")
+             ).arg(
+                Arg::with_name("zmq_addr")
+                    .long("zmq-addr")
+                    .help("Optional zmq socket address of the bitcoind daemon")
                     .takes_value(true),
             ).arg(
             Arg::with_name("skip_history")
@@ -298,6 +363,8 @@ impl Config {
             #[cfg(not(feature = "liquid"))]
             Network::Testnet => 18332,
             #[cfg(not(feature = "liquid"))]
+            Network::Testnet4 => 48332,
+            #[cfg(not(feature = "liquid"))]
             Network::Regtest => 18443,
             #[cfg(not(feature = "liquid"))]
             Network::Signet => 38332,
@@ -312,6 +379,8 @@ impl Config {
             Network::Bitcoin => 50001,
             #[cfg(not(feature = "liquid"))]
             Network::Testnet => 60001,
+            #[cfg(not(feature = "liquid"))]
+            Network::Testnet4 => 40001,
             #[cfg(not(feature = "liquid"))]
             Network::Regtest => 60401,
             #[cfg(not(feature = "liquid"))]
@@ -330,6 +399,8 @@ impl Config {
             #[cfg(not(feature = "liquid"))]
             Network::Testnet => 3001,
             #[cfg(not(feature = "liquid"))]
+            Network::Testnet4 => 3004,
+            #[cfg(not(feature = "liquid"))]
             Network::Regtest => 3002,
             #[cfg(not(feature = "liquid"))]
             Network::Signet => 3003,
@@ -346,6 +417,8 @@ impl Config {
             Network::Bitcoin => 4224,
             #[cfg(not(feature = "liquid"))]
             Network::Testnet => 14224,
+            #[cfg(not(feature = "liquid"))]
+            Network::Testnet4 => 44224,
             #[cfg(not(feature = "liquid"))]
             Network::Regtest => 24224,
             #[cfg(not(feature = "liquid"))]
@@ -374,6 +447,9 @@ impl Config {
                 .unwrap_or(&format!("127.0.0.1:{}", default_http_port)),
             "HTTP Server",
         );
+        let zmq_addr: Option<SocketAddr> = m
+            .value_of("zmq_addr")
+            .map(|e| str_to_socketaddr(e, "ZMQ addr"));
 
         let http_socket_file: Option<PathBuf> = m.value_of("http_socket_file").map(PathBuf::from);
         let monitoring_addr: SocketAddr = str_to_socketaddr(
@@ -418,6 +494,7 @@ impl Config {
             stderrlog::Timestamp::Off
         });
         log.init().expect("logging initialization failed");
+
         let config = Config {
             log,
             network_type,
@@ -425,14 +502,21 @@ impl Config {
             daemon_dir,
             blocks_dir,
             daemon_rpc_addr,
+            daemon_parallelism: value_t_or_exit!(m, "daemon_parallelism", usize),
             cookie,
             utxos_limit: value_t_or_exit!(m, "utxos_limit", usize),
             electrum_rpc_addr,
             electrum_txs_limit: value_t_or_exit!(m, "electrum_txs_limit", usize),
             electrum_banner,
-            electrum_rpc_logging: m
-                .value_of("electrum_rpc_logging")
-                .map(|option| RpcLogging::from(option)),
+            rpc_logging: {
+                let params = RpcLogging {
+                    enabled: m.is_present("enable_json_rpc_logging"),
+                    hide_params: m.is_present("hide_json_rpc_logging_parameters"),
+                    anonymize_ip: m.is_present("anonymize_json_rpc_logging_source_ip"),
+                };
+                params.validate();
+                params
+            },
             http_addr,
             http_socket_file,
             monitoring_addr,
@@ -442,6 +526,11 @@ impl Config {
             index_unspendables: m.is_present("index_unspendables"),
             cors: m.value_of("cors").map(|s| s.to_string()),
             precache_scripts: m.value_of("precache_scripts").map(|s| s.to_string()),
+            initial_sync_compaction: m.is_present("initial_sync_compaction"),
+            db_block_cache_mb: value_t_or_exit!(m, "db_block_cache_mb", usize),
+            db_parallelism: value_t_or_exit!(m, "db_parallelism", usize),
+            db_write_buffer_size_mb: value_t_or_exit!(m, "db_write_buffer_size_mb", usize),
+            zmq_addr,
 
             #[cfg(feature = "liquid")]
             parent_network,
@@ -478,25 +567,17 @@ impl Config {
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum RpcLogging {
-    Full,
-    NoParams,
+#[derive(Debug, Default, Clone)]
+pub struct RpcLogging {
+    pub enabled: bool,
+    pub hide_params: bool,
+    pub anonymize_ip: bool,
 }
 
 impl RpcLogging {
-    pub fn options() -> Vec<String> {
-        return vec!["full".to_string(), "no-params".to_string()];
-    }
-}
-
-impl From<&str> for RpcLogging {
-    fn from(option: &str) -> Self {
-        match option {
-            "full" => RpcLogging::Full,
-            "no-params" => RpcLogging::NoParams,
-
-            _ => panic!("unsupported RPC logging option: {:?}", option),
+    pub fn validate(&self) {
+        if !self.enabled && (self.hide_params || self.anonymize_ip) {
+            panic!("Flags '--hide-json-rpc-logging-parameters' or '--anonymize-json-rpc-logging-source-ip' require '--enable-json-rpc-logging'");
         }
     }
 }
@@ -507,6 +588,8 @@ pub fn get_network_subdir(network: Network) -> Option<&'static str> {
         Network::Bitcoin => None,
         #[cfg(not(feature = "liquid"))]
         Network::Testnet => Some("testnet3"),
+        #[cfg(not(feature = "liquid"))]
+        Network::Testnet4 => Some("testnet4"),
         #[cfg(not(feature = "liquid"))]
         Network::Regtest => Some("regtest"),
         #[cfg(not(feature = "liquid"))]

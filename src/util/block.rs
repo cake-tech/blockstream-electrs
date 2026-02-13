@@ -2,12 +2,14 @@ use crate::chain::{BlockHash, BlockHeader};
 use crate::errors::*;
 use crate::new_index::BlockEntry;
 
+use itertools::Itertools;
 use std::collections::HashMap;
 use std::fmt;
-use std::iter::FromIterator;
 use std::slice;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime as DateTime;
+
+use electrs_macros::trace;
 
 const MTP_SPAN: usize = 11;
 
@@ -18,7 +20,7 @@ lazy_static! {
             .unwrap();
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
 pub struct BlockId {
     pub height: usize,
     pub hash: BlockHash,
@@ -92,6 +94,7 @@ impl HeaderList {
         }
     }
 
+    #[trace]
     pub fn new(
         mut headers_map: HashMap<BlockHash, BlockHeader>,
         tip_hash: BlockHash,
@@ -125,57 +128,88 @@ impl HeaderList {
         );
 
         let mut headers = HeaderList::empty();
-        headers.apply(headers.order(headers_chain));
+        headers.append(headers.preprocess(headers_chain, &tip_hash).0);
         headers
     }
 
-    pub fn order(&self, new_headers: Vec<BlockHeader>) -> Vec<HeaderEntry> {
+    /// Pre-process the given `BlockHeader`s to verify they connect to the chain and to
+    /// transform them into `HeaderEntry`s with heights and hashes - but without saving them.
+    /// If the headers trigger a reorg, the `reorged_since` height is returned too.
+    /// Actually applying the headers requires to first pop() the reorged blocks (if any),
+    /// then append() the new ones.
+    #[trace]
+    pub fn preprocess(
+        &self,
+        new_headers: Vec<BlockHeader>,
+        new_tip: &BlockHash,
+    ) -> (Vec<HeaderEntry>, Option<usize>) {
         // header[i] -> header[i-1] (i.e. header.last() is the tip)
-        struct HashedHeader {
-            blockhash: BlockHash,
-            header: BlockHeader,
-        }
-        let hashed_headers =
-            Vec::<HashedHeader>::from_iter(new_headers.into_iter().map(|header| HashedHeader {
-                blockhash: header.block_hash(),
-                header,
-            }));
-        for i in 1..hashed_headers.len() {
-            assert_eq!(
-                hashed_headers[i].header.prev_blockhash,
-                hashed_headers[i - 1].blockhash
-            );
-        }
-        let prev_blockhash = match hashed_headers.first() {
-            Some(h) => h.header.prev_blockhash,
-            None => return vec![], // hashed_headers is empty
-        };
-        let new_height: usize = if prev_blockhash == *DEFAULT_BLOCKHASH {
-            0
+        let (new_height, header_entries) = if !new_headers.is_empty() {
+            let hashed_headers = new_headers
+                .into_iter()
+                .map(|h| (h.block_hash(), h))
+                .collect::<Vec<_>>();
+            for ((curr_blockhash, _), (_, next_header)) in hashed_headers.iter().tuple_windows() {
+                assert_eq!(*curr_blockhash, next_header.prev_blockhash);
+            }
+            assert_eq!(hashed_headers.last().unwrap().0, *new_tip);
+
+            let prev_blockhash = &hashed_headers.first().unwrap().1.prev_blockhash;
+            let new_height = if *prev_blockhash == *DEFAULT_BLOCKHASH {
+                0
+            } else {
+                self.header_by_blockhash(prev_blockhash)
+                    .expect("headers do not connect")
+                    .height()
+                    + 1
+            };
+            let header_entries = (new_height..)
+                .zip(hashed_headers)
+                .map(|(height, (hash, header))| HeaderEntry {
+                    height,
+                    hash,
+                    header,
+                })
+                .collect();
+            (new_height, header_entries)
         } else {
-            self.header_by_blockhash(&prev_blockhash)
-                .unwrap_or_else(|| panic!("{} is not part of the blockchain", prev_blockhash))
+            // No new headers, but the new tip could potentially shorten the chain (or be a no-op if it matches the existing tip)
+            // This should not normally happen, but might due to manual `invalidateblock`
+            let new_height = self
+                .header_by_blockhash(new_tip)
+                .expect("new tip not in chain")
                 .height()
-                + 1
+                + 1;
+            (new_height, vec![])
         };
-        (new_height..)
-            .zip(hashed_headers.into_iter())
-            .map(|(height, hashed_header)| HeaderEntry {
-                height,
-                hash: hashed_header.blockhash,
-                header: hashed_header.header,
-            })
-            .collect()
+        let reorged_since = (new_height < self.len()).then_some(new_height);
+        (header_entries, reorged_since)
     }
 
-    pub fn apply(&mut self, new_headers: Vec<HeaderEntry>) {
+    /// Pop off reorged blocks since (including) the given height and return them.
+    #[trace]
+    pub fn pop(&mut self, since_height: usize) -> Vec<HeaderEntry> {
+        let reorged_headers = self.headers.split_off(since_height);
+
+        for header in &reorged_headers {
+            self.heights.remove(header.hash());
+        }
+        self.tip = self
+            .headers
+            .last()
+            .map(|h| *h.hash())
+            .unwrap_or_else(|| *DEFAULT_BLOCKHASH);
+
+        reorged_headers
+    }
+
+    /// Append new headers. Expected to always extend the tip (stale blocks must be removed first)
+    #[trace]
+    pub fn append(&mut self, new_headers: Vec<HeaderEntry>) {
         // new_headers[i] -> new_headers[i - 1] (i.e. new_headers.last() is the tip)
-        for i in 1..new_headers.len() {
-            assert_eq!(new_headers[i - 1].height() + 1, new_headers[i].height());
-            assert_eq!(
-                *new_headers[i - 1].hash(),
-                new_headers[i].header().prev_blockhash
-            );
+        for (curr_header, next_header) in new_headers.iter().tuple_windows() {
+            assert_eq!(curr_header.height() + 1, next_header.height());
+            assert_eq!(*curr_header.hash(), next_header.header().prev_blockhash);
         }
         let new_height = match new_headers.first() {
             Some(entry) => {
@@ -195,7 +229,7 @@ impl HeaderList {
             new_headers.len(),
             new_height
         );
-        let _removed = self.headers.split_off(new_height); // keep [0..new_height) entries
+        assert_eq!(new_height, self.headers.len());
         for new_header in new_headers {
             let height = new_header.height();
             assert_eq!(height, self.headers.len());
@@ -205,16 +239,15 @@ impl HeaderList {
         }
     }
 
+    #[trace]
     pub fn header_by_blockhash(&self, blockhash: &BlockHash) -> Option<&HeaderEntry> {
         let height = self.heights.get(blockhash)?;
         let header = self.headers.get(*height)?;
-        if *blockhash == *header.hash() {
-            Some(header)
-        } else {
-            None
-        }
+        assert_eq!(header.hash(), blockhash);
+        Some(header)
     }
 
+    #[trace]
     pub fn header_by_height(&self, height: usize) -> Option<&HeaderEntry> {
         self.headers.get(height).map(|entry| {
             assert_eq!(entry.height(), height);
@@ -241,6 +274,13 @@ impl HeaderList {
         self.headers.len()
     }
 
+    /// Get the chain tip height. Panics if called on an empty HeaderList.
+    pub fn best_height(&self) -> usize {
+        self.len()
+            .checked_sub(1)
+            .expect("best_height() on empty HeaderList")
+    }
+
     pub fn is_empty(&self) -> bool {
         self.headers.is_empty()
     }
@@ -255,7 +295,7 @@ impl HeaderList {
         // Matches bitcoind's behaviour: bitcoin-cli getblock `bitcoin-cli getblockhash 0` | jq '.time == .mediantime'
         if height == 0 {
             self.headers.get(0).unwrap().header.time
-        } else if height > self.len() - 1 {
+        } else if height > self.best_height() {
             0
         } else {
             let mut timestamps = (height.saturating_sub(MTP_SPAN - 1)..=height)

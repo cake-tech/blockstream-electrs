@@ -1,4 +1,7 @@
 pub mod common;
+use std::io::{Read, Write};
+use std::net::TcpStream;
+
 use common::Result;
 
 use bitcoind::bitcoincore_rpc::RpcApi;
@@ -21,7 +24,11 @@ fn test_electrum() -> Result<()> {
     // Spawn an headless Electrum wallet RPC daemon, connected to Electrs
     let mut electrum_wallet_conf = electrumd::Conf::default();
     let server_arg = format!("{}:t", electrum_addr.to_string());
-    electrum_wallet_conf.args = vec!["-v", "--server", &server_arg];
+    electrum_wallet_conf.args = if std::env::var_os("RUST_LOG").is_some() {
+        vec!["-v", "--server", &server_arg]
+    } else {
+        vec!["--server", &server_arg]
+    };
     electrum_wallet_conf.view_stdout = true;
     let electrum_wallet = ElectrumD::with_conf(electrumd::exe_path()?, &electrum_wallet_conf)?;
 
@@ -132,4 +139,46 @@ fn test_electrum() -> Result<()> {
     assert_balance(0.139, 0.0);
 
     Ok(())
+}
+
+/// Test the Electrum RPC server using a raw TCP socket
+/// This only runs on Bitcoin (non-Liquid) mode.
+#[cfg_attr(not(feature = "liquid"), test)]
+#[cfg_attr(feature = "liquid", allow(dead_code))]
+#[ignore = "must be launched singularly, otherwise conflict with the other server"]
+fn test_electrum_raw() {
+    // Spawn an Electrs Electrum RPC server
+    let (_electrum_server, electrum_addr, mut _tester) = common::init_electrum_tester().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1000));
+
+    let mut stream = TcpStream::connect(electrum_addr).unwrap();
+    let write = "{\"jsonrpc\": \"2.0\", \"method\": \"server.version\", \"id\": 0}";
+
+    let s = write_and_read(&mut stream, write);
+    let expected = "{\"id\":0,\"jsonrpc\":\"2.0\",\"result\":[\"electrs-esplora 0.4.1\",\"1.4\"]}";
+    assert_eq!(s, expected);
+
+    let write = "[{\"jsonrpc\": \"2.0\", \"method\": \"server.version\", \"id\": 0}]";
+    let s = write_and_read(&mut stream, write);
+    let expected =
+        "[{\"id\":0,\"jsonrpc\":\"2.0\",\"result\":[\"electrs-esplora 0.4.1\",\"1.4\"]}]";
+    assert_eq!(s, expected);
+}
+
+fn write_and_read(stream: &mut TcpStream, write: &str) -> String {
+    stream.write_all(write.as_bytes()).unwrap();
+    stream.write(b"\n").unwrap();
+    stream.flush().unwrap();
+    let mut result = vec![];
+    loop {
+        let mut buf = [0u8];
+        stream.read_exact(&mut buf).unwrap();
+
+        if buf[0] == b'\n' {
+            break;
+        } else {
+            result.push(buf[0]);
+        }
+    }
+    std::str::from_utf8(&result).unwrap().to_string()
 }

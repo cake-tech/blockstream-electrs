@@ -1,9 +1,11 @@
 pub mod db;
+pub mod db_metrics;
 mod fetch;
 mod mempool;
 pub mod precache;
 mod query;
 pub mod schema;
+pub mod zmq;
 
 pub use self::db::{DBRow, DB};
 pub use self::fetch::{BlockEntry, FetchFrom};

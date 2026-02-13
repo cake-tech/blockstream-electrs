@@ -7,12 +7,15 @@ use crypto::digest::Digest;
 use crypto::sha2::Sha256;
 use rayon::prelude::*;
 
-use hex::FromHex;
+use bitcoin::hex::FromHex;
 use std::fs::File;
 use std::io;
 use std::io::prelude::*;
 use std::str::FromStr;
 
+use electrs_macros::trace;
+
+#[trace]
 pub fn precache(chain: &ChainQuery, scripthashes: Vec<FullHash>) {
     let total = scripthashes.len();
     info!("Pre-caching stats and utxo set for {} scripthashes", total);
@@ -36,6 +39,7 @@ pub fn precache(chain: &ChainQuery, scripthashes: Vec<FullHash>) {
     });
 }
 
+#[trace]
 pub fn scripthashes_from_file(path: String) -> Result<Vec<FullHash>> {
     let reader =
         io::BufReader::new(File::open(path).chain_err(|| "cannot open precache scripthash file")?);

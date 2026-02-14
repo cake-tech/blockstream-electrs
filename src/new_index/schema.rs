@@ -6,7 +6,7 @@ use bitcoin::VarInt;
 use bitcoin::{Amount, Witness};
 use crypto::digest::Digest;
 use crypto::sha2::Sha256;
-use hex::{DisplayHex, FromHex};
+use bitcoin::hex::DisplayHex;
 use itertools::Itertools;
 use rayon::prelude::*;
 
@@ -82,7 +82,6 @@ impl Store {
         txstore_db.start_stats_exporter(Arc::clone(&db_metrics), "txstore_db");
         history_db.start_stats_exporter(Arc::clone(&db_metrics), "history_db");
         cache_db.start_stats_exporter(Arc::clone(&db_metrics), "cache_db");
->>>>>>> new-index
 
         let headers = if let Some(tip_hash) = txstore_db.get(b"t") {
             let mut tip_hash = deserialize(&tip_hash).expect("invalid chain tip in `t`");
@@ -524,8 +523,8 @@ impl Indexer {
     }
 
     fn index(&self, blocks: &[BlockEntry]) {
-        let mut indexed_blockhashes = self.store.indexed_blockhashes.write().unwrap();
-        indexed_blockhashes.extend(blocks.iter().map(|b| b.entry.hash()));
+        // Indexed blockhashes are tracked in the history_db via BlockRow::done_filter()
+        // No need to maintain a separate in-memory set
     }
 
     // Undo the history db entries previously written for the given blocks (that were reorged).
@@ -544,10 +543,8 @@ impl Indexer {
         // This is true for all history keys (which always include the height or txid), but for example
         // not true for the address prefix search index (in the txstore).
 
-        let mut indexed_blockhashes = self.store.indexed_blockhashes.write().unwrap();
-        for block in blocks {
-            indexed_blockhashes.remove(block.entry.hash());
-        }
+        // Indexed blockhashes are tracked in the history_db
+        // Removal is handled by deleting the BlockRow entries
     }
 
     fn _index(&self, blocks: &[BlockEntry]) -> Vec<DBRow> {
@@ -555,7 +552,6 @@ impl Indexer {
             let _timer = self.start_timer("index_lookup");
             lookup_txos(&self.store.txstore_db, get_previous_txos(blocks)).unwrap()
         };
->>>>>>> new-index
         let rows = {
             let _timer = self.start_timer("index_process");
             blocks
@@ -686,7 +682,7 @@ impl Indexer {
                 .collect()
         };
 
-        self.store.tweak_db().write(rows, self.flush);
+        self.store.tweak_db().write_rows(rows, self.flush);
         self.store.tweak_db().flush();
     }
 
@@ -704,7 +700,7 @@ impl Indexer {
             if is_spendable(txo) {
                 let amount = (txo.value as Amount).to_sat();
                 #[allow(deprecated)]
-                if txo.script_pubkey.is_v1_p2tr()
+                if txo.script_pubkey.is_p2tr()
                     && amount >= self.iconfig.sp_min_dust.unwrap_or(1_000) as u64
                 {
                     output_pubkeys.push(VoutData {
@@ -765,7 +761,7 @@ impl Indexer {
                         blockheight,
                         txid.clone(),
                         &TweakData {
-                            tweak: tweak.serialize().to_lower_hex_string(),
+                            tweak: tweak.serialize().to_lower_hex(),
                             vout_data: output_pubkeys.clone(),
                         },
                     )
@@ -782,17 +778,11 @@ impl Indexer {
 
     pub fn tx_confirming_block(&self, txid: &Txid) -> Option<BlockId> {
         let _timer = self.start_timer("tx_confirming_block");
+        let row_value = self.store.history_db.get(&TxConfRow::key(txid))?;
+        let height = TxConfRow::height_from_val(&row_value);
         let headers = self.store.indexed_headers.read().unwrap();
-        self.store
-            .txstore_db
-            .iter_scan(&TxConfRow::filter(&txid[..]))
-            .map(TxConfRow::from_row)
-            // header_by_blockhash only returns blocks that are part of the best chain,
-            // or None for orphaned blocks.
-            .find_map(|conf| {
-                headers.header_by_blockhash(&deserialize(&conf.key.blockhash).unwrap())
-            })
-            .map(BlockId::from)
+        // skip over entries that point to non-existing heights (may happen while new/reorged blocks are being processed)
+        Some(headers.header_by_height(height as usize)?.into())
     }
 
     pub fn lookup_spend(&self, outpoint: &OutPoint) -> Option<SpendingInput> {
@@ -1310,7 +1300,7 @@ impl ChainQuery {
 
         tweaks
             .into_iter()
-            .map(|tweak| tweak.to_lower_hex_string())
+            .map(|tweak| tweak.to_lower_hex())
             .collect()
     }
 
@@ -1474,7 +1464,6 @@ impl ChainQuery {
         let _timer = self.start_timer("lookup_confirmations");
         let headers = self.store.indexed_headers.read().unwrap();
         lookup_confirmations(&self.store.history_db, headers.best_height() as u32, txids)
->>>>>>> new-index
     }
 
     pub fn get_block_status(&self, hash: &BlockHash) -> BlockStatus {
@@ -1581,7 +1570,7 @@ fn add_blocks(block_entries: &[BlockEntry], iconfig: &IndexerConfig) -> Vec<DBRo
 
 fn add_transaction(txid: Txid, tx: &Transaction, rows: &mut Vec<DBRow>, iconfig: &IndexerConfig) {
     if !iconfig.light_mode {
-        rows.push(TxRow::new(txid, tx).into_row());
+        rows.push(TxRow::new(tx).into_row());
     }
 
     let txid = full_hash(&txid[..]);
@@ -1661,6 +1650,23 @@ impl TweakBlockRecordCacheRow {
     pub fn code() -> u8 {
         b'T'
     }
+
+    pub fn into_row(self) -> DBRow {
+        DBRow {
+            key: bincode::serialize_big(&self.key).unwrap(),
+            value: bincode::serialize_big(&self.value).unwrap(),
+        }
+    }
+
+    pub fn key(height: u32) -> Bytes {
+        bincode::serialize_big(&(TweakBlockRecordCacheRow::code(), height)).unwrap()
+    }
+
+    pub fn from_row(row: DBRow) -> TweakBlockRecordCacheRow {
+        let key: TweakBlockRecordCacheKey = bincode::deserialize_big(&row.key).unwrap();
+        let value: u32 = bincode::deserialize_big(&row.value).unwrap();
+        TweakBlockRecordCacheRow { key, value }
+    }
 }
 
 pub fn lookup_confirmations(
@@ -1731,7 +1737,6 @@ fn index_transaction(
                 }),
             );
             rows.push(history.into_row());
->>>>>>> new-index
         }
     }
 
@@ -1870,6 +1875,7 @@ struct TxRow {
 
 impl TxRow {
     fn new(txn: &Transaction) -> TxRow {
+        #[allow(deprecated)]
         let txid = full_hash(&txn.txid()[..]);
         TxRow {
             key: TxRowKey { code: b'T', txid },
@@ -1926,6 +1932,16 @@ impl TxConfRow {
 
     fn height_from_val(val: &[u8]) -> u32 {
         u32::from_le_bytes(val.try_into().expect("invalid TxConf value"))
+    }
+
+    fn filter(txid_prefix: &[u8]) -> Bytes {
+        [b"C", txid_prefix].concat()
+    }
+
+    fn from_row(row: DBRow) -> TxConfRow {
+        let key: TxConfKey = bincode::deserialize_little(&row.key).unwrap();
+        let value = Self::height_from_val(&row.value);
+        TxConfRow { key, value }
     }
 }
 
@@ -2228,6 +2244,16 @@ impl TxEdgeRow {
     fn key(outpoint: &OutPoint) -> Bytes {
         bincode::serialize_little(&(b'S', full_hash(&outpoint.txid[..]), outpoint.vout as u16))
             .unwrap()
+    }
+
+    fn filter(outpoint: &OutPoint) -> Bytes {
+        Self::key(outpoint)
+    }
+
+    fn from_row(row: DBRow) -> Self {
+        let key: TxEdgeKey = bincode::deserialize_little(&row.key).unwrap();
+        let value: TxEdgeValue = bincode::deserialize_little(&row.value).unwrap();
+        TxEdgeRow { key, value }
     }
 
     pub fn into_row(self) -> DBRow {

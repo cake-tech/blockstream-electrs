@@ -2,7 +2,6 @@ use bitcoin::hashes::sha256d::Hash as Sha256dHash;
 use bitcoin::hex::FromHex;
 #[cfg(not(feature = "liquid"))]
 use bitcoin::merkle_tree::MerkleBlock;
-use bitcoin::VarInt;
 use bitcoin::{Amount, Witness};
 use crypto::digest::Digest;
 use crypto::sha2::Sha256;
@@ -619,6 +618,7 @@ impl Indexer {
                                 txi.previous_output.vout as u16,
                                 txid,
                                 txi_index as u16,
+                                height,
                             );
                             rows.push(edge.into_row());
                         }
@@ -792,10 +792,10 @@ impl Indexer {
             .iter_scan(&TxEdgeRow::filter(&outpoint))
             .map(TxEdgeRow::from_row)
             .find_map(|edge| {
-                let txid: Txid = deserialize(&edge.key.spending_txid).unwrap();
+                let txid: Txid = deserialize(&edge.value.spending_txid).unwrap();
                 self.tx_confirming_block(&txid).map(|b| SpendingInput {
                     txid,
-                    vin: edge.key.spending_vin as u32,
+                    vin: edge.value.spending_vin as u32,
                     confirmed: Some(b),
                 })
             })

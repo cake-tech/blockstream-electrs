@@ -546,10 +546,6 @@ impl Indexer {
     }
 
     fn _index(&self, blocks: &[BlockEntry]) -> Vec<DBRow> {
-        let previous_txos_map = {
-            let _timer = self.start_timer("index_lookup");
-            lookup_txos(&self.store.txstore_db, get_previous_txos(blocks)).unwrap()
-        };
         let rows = {
             let _timer = self.start_timer("index_process");
             blocks
@@ -1908,15 +1904,6 @@ impl TxConfRow {
         u32::from_le_bytes(val.try_into().expect("invalid TxConf value"))
     }
 
-    fn filter(txid_prefix: &[u8]) -> Bytes {
-        [b"C", txid_prefix].concat()
-    }
-
-    fn from_row(row: DBRow) -> TxConfRow {
-        let key: TxConfKey = bincode::deserialize_little(&row.key).unwrap();
-        let value = Self::height_from_val(&row.value);
-        TxConfRow { key, value }
-    }
 }
 
 #[derive(Serialize, Deserialize)]

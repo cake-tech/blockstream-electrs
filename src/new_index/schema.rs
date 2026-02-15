@@ -5,7 +5,7 @@ use bitcoin::merkle_tree::MerkleBlock;
 use bitcoin::{Amount, Witness};
 use crypto::digest::Digest;
 use crypto::sha2::Sha256;
-use hex::{DisplayHex, FromHex};
+use hex;
 use itertools::Itertools;
 use rayon::prelude::*;
 
@@ -760,7 +760,7 @@ impl Indexer {
                         blockheight,
                         txid.clone(),
                         &TweakData {
-                            tweak: tweak.serialize().to_lower_hex(),
+                            tweak: hex::encode(tweak.serialize()),
                             vout_data: output_pubkeys.clone(),
                         },
                     )
@@ -1299,7 +1299,7 @@ impl ChainQuery {
 
         tweaks
             .into_iter()
-            .map(|tweak| tweak.to_lower_hex())
+            .map(|tweak| hex::encode(tweak))
             .collect()
     }
 

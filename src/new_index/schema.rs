@@ -5,7 +5,7 @@ use bitcoin::merkle_tree::MerkleBlock;
 use bitcoin::{Amount, Witness};
 use crypto::digest::Digest;
 use crypto::sha2::Sha256;
-use bitcoin::hex::DisplayHex;
+use hex::{DisplayHex, FromHex};
 use itertools::Itertools;
 use rayon::prelude::*;
 
@@ -21,7 +21,6 @@ use silentpayments::utils::receiving::{calculate_tweak_data, get_pubkey_from_inp
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::convert::TryInto;
-use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 
@@ -561,7 +560,7 @@ impl Indexer {
 
                     let mut rows = vec![];
                     for tx in &b.block.txdata {
-                        let txid = full_hash(&tx.txid()[..]);
+                        let txid = full_hash(&tx.compute_txid()[..]);
                         // persist history index:
                         //      H{funding-scripthash}{funding-height}F{funding-txid:vout} → ""
                         //      H{funding-scripthash}{spending-height}S{spending-txid:vin}{funding-txid:vout} → ""
@@ -693,7 +692,7 @@ impl Indexer {
         rows: &mut Vec<DBRow>,
         tweaks: &mut Vec<Vec<u8>>,
     ) {
-        let txid = &tx.txid();
+        let txid = &tx.compute_txid();
         let mut output_pubkeys: Vec<VoutData> = Vec::with_capacity(tx.output.len());
 
         for (txo_index, txo) in tx.output.iter().enumerate() {
@@ -1740,31 +1739,6 @@ fn index_transaction(
         }
     }
 
-    pub fn code() -> u8 {
-        b'B'
-    }
-
-    pub fn key(height: u32) -> Bytes {
-        bincode::serialize_big(&TweakBlockRecordCacheKey {
-            code: TweakBlockRecordCacheRow::code(),
-            height,
-        })
-        .unwrap()
-    }
-
-    pub fn from_row(row: DBRow) -> TweakBlockRecordCacheRow {
-        let key: TweakBlockRecordCacheKey = bincode::deserialize_big(&row.key).unwrap();
-        let value: u32 = bincode::deserialize_big(&row.value).unwrap();
-        TweakBlockRecordCacheRow { key, value }
-    }
-
-    pub fn into_row(self) -> DBRow {
-        let TweakBlockRecordCacheRow { key, value } = self;
-        DBRow {
-            key: bincode::serialize_big(&key).unwrap(),
-            value: bincode::serialize_big(&value).unwrap(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -121,6 +121,18 @@ impl TestRunner {
             db_block_cache_mb: 8,
             db_parallelism: 2,
             db_write_buffer_size_mb: 256,
+            #[cfg(feature = "silent-payments")]
+            sp_begin_height: Some(0), // regtest: tweak-index from block 0 so SP tests run
+            #[cfg(not(feature = "silent-payments"))]
+            sp_begin_height: None,
+            sp_min_dust: None,
+            sp_check_spends: false,
+            skip_history: false,
+            #[cfg(feature = "silent-payments")]
+            skip_tweaks: false,
+            #[cfg(not(feature = "silent-payments"))]
+            skip_tweaks: true,
+            skip_mempool: false,
             //#[cfg(feature = "electrum-discovery")]
             //electrum_public_hosts: Option<crate::electrum::ServerHosts>,
             //#[cfg(feature = "electrum-discovery")]

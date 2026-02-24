@@ -371,24 +371,16 @@ impl Indexer {
     pub fn update(&mut self, daemon: &Daemon) -> Result<BlockHash> {
         let daemon = daemon.reconnect()?;
         let tip = daemon.getbestblockhash()?;
-
         let (new_headers, reorged_since) = self.get_new_headers(&daemon, &tip)?;
 
         // Handle reorgs by undoing the reorged (stale) blocks first
         if let Some(reorged_since) = reorged_since {
-            // Remove reorged headers from the in-memory HeaderList.
-            // This will also immediately invalidate all the history db entries originating from those blocks
-            // (even before the rows are deleted below), since they reference block heights that will no longer exist.
-            // This ensures consistency - it is not possible for blocks to be available (e.g. in GET /blocks/tip or /block/:hash)
-            // without the corresponding history entries for these blocks (e.g. in GET /address/:address/txs), or vice-versa.
             let mut reorged_headers = self
                 .store
                 .indexed_headers
                 .write()
                 .unwrap()
                 .pop(reorged_since);
-            // The chain tip will temporarily drop to the common ancestor (at height reorged_since-1),
-            // until the new headers are `append()`ed (below).
 
             info!(
                 "processing reorg of depth {} since height {}",
@@ -396,62 +388,38 @@ impl Indexer {
                 reorged_since,
             );
 
-            // Reorged blocks are undone in chunks of 100, processed in serial, each as an atomic batch.
-            // Reverse them so that chunks closest to the chain tip are processed first,
-            // which is necessary to properly recover from crashes during reorg handling.
-            // Also see the comment under `Store::open()`.
             reorged_headers.reverse();
-
-            // Fetch the reorged blocks, then undo their history index db rows.
-            // The txstore db rows are kept for reorged blocks/transactions.
             start_fetcher(self.from, &daemon, reorged_headers)?
                 .map(|blocks| self.undo_index(&blocks));
         }
 
-        // Add new blocks to the txstore db
         let to_add = self.headers_to_add(&new_headers);
-        debug!(
-            "adding transactions from {} blocks using {:?}",
-            to_add.len(),
-            self.from
-        );
-
-        let mut fetcher_count = 0;
-        let mut blocks_fetched = 0;
-        let to_add_total = to_add.len();
-
-        start_fetcher(self.from, &daemon, to_add)?.map(|blocks|
-            {
-                if fetcher_count % 25 == 0 && to_add_total > 20 {
-                    info!("adding txes from blocks {}/{} ({:.1}%)",
-                        blocks_fetched,
-                        to_add_total,
-                        blocks_fetched as f32 / to_add_total as f32 * 100.0
-                    );
-                }
-                fetcher_count += 1;
-                blocks_fetched += blocks.len();
-
-                self.add(&blocks)
-            });
-
-        self.start_auto_compactions(&self.store.txstore_db);
-
-        // Index new blocks to the history db
-        if !self.iconfig.skip_history {
-            let to_index = self.headers_to_index(&new_headers);
+        if !to_add.is_empty() {
             debug!(
-                "indexing history from {} blocks using {:?}",
-                to_index.len(),
+                "adding transactions from {} blocks using {:?}",
+                to_add.len(),
                 self.from
             );
-            start_fetcher(self.from, &daemon, to_index)?.map(|blocks| self.index(&blocks));
-            self.start_auto_compactions(&self.store.history_db);
+            start_fetcher(self.from, &daemon, to_add)?.map(|blocks| self.add(&blocks));
+            self.start_auto_compactions(&self.store.txstore_db());
+        }
+
+        if !self.iconfig.skip_history {
+            let to_index = self.headers_to_index(&new_headers);
+            if !to_index.is_empty() {
+                debug!(
+                    "indexing history from {} blocks using {:?}",
+                    to_index.len(),
+                    self.from
+                );
+                start_fetcher(self.from, &daemon, to_index)?.map(|blocks| self.index(&blocks));
+                self.start_auto_compactions(&self.store.history_db);
+                self.start_auto_compactions(&self.store.cache_db);
+            }
         } else {
             debug!("Skipping history indexing");
         }
 
-        // Index silent payment tweaks
         if !self.iconfig.skip_tweaks {
             let to_tweak = self.headers_to_tweak(&new_headers);
             if !to_tweak.is_empty() {
@@ -472,8 +440,6 @@ impl Indexer {
             debug!("Skipping tweaks indexing");
         }
 
-        self.start_auto_compactions(&self.store.cache_db);
-
         if let DBFlush::Disable = self.flush {
             debug!("flushing to disk");
             self.store.txstore_db.flush();
@@ -481,12 +447,10 @@ impl Indexer {
             self.flush = DBFlush::Enable;
         }
 
-        // Update the synced tip after all db writes are flushed
+        // update the synced tip *after* the new data is flushed to disk
         debug!("updating synced tip to {:?}", tip);
         self.store.txstore_db.put_sync(b"t", &serialize(&tip));
 
-        // Finally, append the new headers to the in-memory HeaderList.
-        // This will make both the headers and the history entries visible in the public APIs, consistently with each-other.
         let mut headers = self.store.indexed_headers.write().unwrap();
         headers.append(new_headers);
         assert_eq!(tip, *headers.tip());

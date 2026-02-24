@@ -588,6 +588,7 @@ impl Indexer {
                                 txi.previous_output.vout as u16,
                                 txid,
                                 txi_index as u16,
+                                height,
                             );
                             rows.push(edge.into_row());
                         }
@@ -609,7 +610,7 @@ impl Indexer {
                 .flatten()
                 .collect()
         };
-        self.store.history_db.write(rows, self.flush);
+        self.store.history_db.write_rows(rows, self.flush);
     }
 
     // Undo the history db entries previously written for the given blocks (that were reorged).

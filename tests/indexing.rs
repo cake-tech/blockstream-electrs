@@ -75,11 +75,10 @@ fn test_sp_tweak_indexing() -> Result<()> {
 fn test_indexing_after_new_block() -> Result<()> {
     // Mine one more block and sync; index state should update
     let mut tester = common::TestRunner::new()?;
-    let store = tester.store();
-    let indexed_before = store.indexed_blockhashes().len();
+    let indexed_before = tester.store().indexed_blockhashes().len();
 
     tester.mine()?;
-    let indexed_after = store.indexed_blockhashes().len();
+    let indexed_after = tester.store().indexed_blockhashes().len();
 
     assert!(
         indexed_after >= indexed_before,

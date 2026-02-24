@@ -58,6 +58,7 @@ pub struct Store {
     tweak_db: DB,
     cache_db: DB,
     pub added_blockhashes: RwLock<HashSet<BlockHash>>,
+    indexed_blockhashes: RwLock<HashSet<BlockHash>>,
     pub indexed_headers: RwLock<HeaderList>,
 }
 
@@ -113,6 +114,7 @@ impl Store {
             tweak_db,
             cache_db,
             added_blockhashes: RwLock::new(added_blockhashes),
+            indexed_blockhashes: RwLock::new(indexed_blockhashes),
             indexed_headers: RwLock::new(headers),
         }
     }
@@ -142,9 +144,7 @@ impl Store {
     }
 
     pub fn indexed_blockhashes(&self) -> HashSet<BlockHash> {
-        let indexed_blockhashes = load_blockhashes(&self.history_db, &BlockRow::done_filter());
-        debug!("{} blocks were indexed", indexed_blockhashes.len());
-        indexed_blockhashes
+        self.indexed_blockhashes.read().unwrap().clone()
     }
 
     pub fn tweaked_blockhashes(&self) -> HashSet<BlockHash> {
@@ -375,12 +375,19 @@ impl Indexer {
 
         // Handle reorgs by undoing the reorged (stale) blocks first
         if let Some(reorged_since) = reorged_since {
+            // Remove reorged headers from the in-memory HeaderList.
+            // This will also immediately invalidate all the history db entries originating from those blocks
+            // (even before the rows are deleted below), since they reference block heights that will no longer exist.
+            // This ensures consistency - it is not possible for blocks to be available (e.g. in GET /blocks/tip or /block/:hash)
+            // without the corresponding history entries for these blocks (e.g. in GET /address/:address/txs), or vice-versa.
             let mut reorged_headers = self
                 .store
                 .indexed_headers
                 .write()
                 .unwrap()
                 .pop(reorged_since);
+            // The chain tip will temporarily drop to the common ancestor (at height reorged_since-1),
+            // until the new headers are `append()`ed (below).
 
             info!(
                 "processing reorg of depth {} since height {}",
@@ -388,11 +395,19 @@ impl Indexer {
                 reorged_since,
             );
 
+            // Reorged blocks are undone in chunks of 100, processed in serial, each as an atomic batch.
+            // Reverse them so that chunks closest to the chain tip are processed first,
+            // which is necessary to properly recover from crashes during reorg handling.
+            // Also see the comment under `Store::open()`.
             reorged_headers.reverse();
+
+            // Fetch the reorged blocks, then undo their history index db rows.
+            // The txstore db rows are kept for reorged blocks/transactions.
             start_fetcher(self.from, &daemon, reorged_headers)?
                 .map(|blocks| self.undo_index(&blocks));
         }
 
+        // Add new blocks to the txstore db
         let to_add = self.headers_to_add(&new_headers);
         if !to_add.is_empty() {
             debug!(
@@ -400,10 +415,29 @@ impl Indexer {
                 to_add.len(),
                 self.from
             );
-            start_fetcher(self.from, &daemon, to_add)?.map(|blocks| self.add(&blocks));
+
+            let mut fetcher_count = 0;
+            let mut blocks_fetched = 0;
+            let to_add_total = to_add.len();
+
+            start_fetcher(self.from, &daemon, to_add)?.map(|blocks| {
+                if fetcher_count % 25 == 0 && to_add_total > 20 {
+                    info!(
+                        "adding txes from blocks {}/{} ({:.1}%)",
+                        blocks_fetched,
+                        to_add_total,
+                        blocks_fetched as f32 / to_add_total as f32 * 100.0
+                    );
+                }
+                fetcher_count += 1;
+                blocks_fetched += blocks.len();
+
+                self.add(&blocks)
+            });
             self.start_auto_compactions(&self.store.txstore_db());
         }
 
+        // Index new blocks to the history db
         if !self.iconfig.skip_history {
             let to_index = self.headers_to_index(&new_headers);
             if !to_index.is_empty() {
@@ -447,10 +481,12 @@ impl Indexer {
             self.flush = DBFlush::Enable;
         }
 
-        // update the synced tip *after* the new data is flushed to disk
+        // Update the synced tip after all db writes are flushed
         debug!("updating synced tip to {:?}", tip);
         self.store.txstore_db.put_sync(b"t", &serialize(&tip));
 
+        // Finally, append the new headers to the in-memory HeaderList.
+        // This will make both the headers and the history entries visible in the public APIs, consistently with each-other.
         let mut headers = self.store.indexed_headers.write().unwrap();
         headers.append(new_headers);
         assert_eq!(tip, *headers.tip());
@@ -485,96 +521,12 @@ impl Indexer {
     }
 
     fn index(&self, blocks: &[BlockEntry]) {
-        let rows = {
-            let _timer = self.start_timer("index_process");
-            blocks
-                .par_iter() // serialization is CPU-intensive
-                .map(|b| {
-                    let height = b.entry.height() as u32;
-                    debug!("indexing block {}", height);
+        self.store
+            .history_db
+            .write_rows(self._index(blocks), self.flush);
 
-                    let mut rows = vec![];
-                    for tx in &b.block.txdata {
-                        let txid = full_hash(&tx.txid()[..]);
-                        // persist history index:
-                        //      H{funding-scripthash}{funding-height}F{funding-txid:vout} → ""
-                        //      H{funding-scripthash}{spending-height}S{spending-txid:vin}{funding-txid:vout} → ""
-                        // persist "edges" for fast is-this-TXO-spent check
-                        //      S{funding-txid:vout}{spending-txid:vin} → ""
-                        for (txo_index, txo) in tx.output.iter().enumerate() {
-                            if is_spendable(txo) || self.iconfig.index_unspendables {
-                                let history = TxHistoryRow::new(
-                                    &txo.script_pubkey,
-                                    height,
-                                    TxHistoryInfo::Funding(FundingInfo {
-                                        txid,
-                                        vout: txo_index as u16,
-                                        value: txo.value.amount_value(),
-                                    }),
-                                );
-                                rows.push(history.into_row());
-
-                                // for prefix address search, only saved when --address-search is enabled
-                                //      a{funding-address-str} → ""
-                                if self.iconfig.address_search {
-                                    if let Some(row) =
-                                        addr_search_row(&txo.script_pubkey, self.iconfig.network)
-                                    {
-                                        rows.push(row);
-                                    }
-                                }
-                            }
-                        }
-                        for (txi_index, txi) in tx.input.iter().enumerate() {
-                            if !has_prevout(txi) {
-                                continue;
-                            }
-                            let prev_txo = lookup_txo(&self.store.txstore_db, &txi.previous_output)
-                                .unwrap_or_else(|| {
-                                    panic!("missing previous txo {}", txi.previous_output)
-                                });
-
-                            let history = TxHistoryRow::new(
-                                &prev_txo.script_pubkey,
-                                height,
-                                TxHistoryInfo::Spending(SpendingInfo {
-                                    txid,
-                                    vin: txi_index as u16,
-                                    prev_txid: full_hash(&txi.previous_output.txid[..]),
-                                    prev_vout: txi.previous_output.vout as u16,
-                                    value: prev_txo.value.amount_value(),
-                                }),
-                            );
-                            rows.push(history.into_row());
-
-                            let edge = TxEdgeRow::new(
-                                full_hash(&txi.previous_output.txid[..]),
-                                txi.previous_output.vout as u16,
-                                txid,
-                                txi_index as u16,
-                                height,
-                            );
-                            rows.push(edge.into_row());
-                        }
-
-                        // Index issued assets & native asset pegins/pegouts/burns
-                        #[cfg(feature = "liquid")]
-                        asset::index_confirmed_tx_assets(
-                            tx,
-                            height,
-                            self.iconfig.network,
-                            self.iconfig.parent_network,
-                            &mut rows,
-                        );
-                    }
-
-                    rows.push(BlockRow::new_done(full_hash(&b.entry.hash()[..])).into_row()); // mark block as "indexed"
-                    rows
-                })
-                .flatten()
-                .collect()
-        };
-        self.store.history_db.write_rows(rows, self.flush);
+        let mut indexed_blockhashes = self.store.indexed_blockhashes.write().unwrap();
+        indexed_blockhashes.extend(blocks.iter().map(|b| b.entry.hash()));
     }
 
     // Undo the history db entries previously written for the given blocks (that were reorged).
@@ -593,99 +545,27 @@ impl Indexer {
         // This is true for all history keys (which always include the height or txid), but for example
         // not true for the address prefix search index (in the txstore).
 
-        // Indexed blockhashes are tracked in the history_db
-        // Removal is handled by deleting the BlockRow entries
+        let mut indexed_blockhashes = self.store.indexed_blockhashes.write().unwrap();
+        for block in blocks {
+            indexed_blockhashes.remove(block.entry.hash());
+        }
     }
 
     fn _index(&self, blocks: &[BlockEntry]) -> Vec<DBRow> {
+        let previous_txos_map = {
+            let _timer = self.start_timer("index_lookup");
+            lookup_txos(&self.store.txstore_db, get_previous_txos(blocks)).unwrap()
+        };
         let rows = {
             let _timer = self.start_timer("index_process");
-            blocks
-                .par_iter() // serialization is CPU-intensive
-                .map(|b| {
-                    let height = b.entry.height() as u32;
-                    debug!("indexing block {}", height);
-
-                    let mut rows = vec![];
-                    for tx in &b.block.txdata {
-                        let txid = full_hash(&tx.compute_txid()[..]);
-                        // persist history index:
-                        //      H{funding-scripthash}{funding-height}F{funding-txid:vout} → ""
-                        //      H{funding-scripthash}{spending-height}S{spending-txid:vin}{funding-txid:vout} → ""
-                        // persist "edges" for fast is-this-TXO-spent check
-                        //      S{funding-txid:vout}{spending-txid:vin} → ""
-                        for (txo_index, txo) in tx.output.iter().enumerate() {
-                            if is_spendable(txo) || self.iconfig.index_unspendables {
-                                let history = TxHistoryRow::new(
-                                    &txo.script_pubkey,
-                                    height,
-                                    TxHistoryInfo::Funding(FundingInfo {
-                                        txid,
-                                        vout: txo_index as u16,
-                                        value: txo.value.amount_value(),
-                                    }),
-                                );
-                                rows.push(history.into_row());
-
-                                // for prefix address search, only saved when --address-search is enabled
-                                //      a{funding-address-str} → ""
-                                if self.iconfig.address_search {
-                                    if let Some(row) =
-                                        addr_search_row(&txo.script_pubkey, self.iconfig.network)
-                                    {
-                                        rows.push(row);
-                                    }
-                                }
-                            }
-                        }
-                        for (txi_index, txi) in tx.input.iter().enumerate() {
-                            if !has_prevout(txi) {
-                                continue;
-                            }
-                            let prev_txo = lookup_txo(&self.store.txstore_db, &txi.previous_output)
-                                .unwrap_or_else(|| {
-                                    panic!("missing previous txo {}", txi.previous_output)
-                                });
-
-                            let history = TxHistoryRow::new(
-                                &prev_txo.script_pubkey,
-                                height,
-                                TxHistoryInfo::Spending(SpendingInfo {
-                                    txid,
-                                    vin: txi_index as u16,
-                                    prev_txid: full_hash(&txi.previous_output.txid[..]),
-                                    prev_vout: txi.previous_output.vout as u16,
-                                    value: prev_txo.value.amount_value(),
-                                }),
-                            );
-                            rows.push(history.into_row());
-
-                            let edge = TxEdgeRow::new(
-                                full_hash(&txi.previous_output.txid[..]),
-                                txi.previous_output.vout as u16,
-                                txid,
-                                txi_index as u16,
-                                height,
-                            );
-                            rows.push(edge.into_row());
-                        }
-
-                        // Index issued assets & native asset pegins/pegouts/burns
-                        #[cfg(feature = "liquid")]
-                        asset::index_confirmed_tx_assets(
-                            tx,
-                            height,
-                            self.iconfig.network,
-                            self.iconfig.parent_network,
-                            &mut rows,
-                        );
-                    }
-
-                    rows.push(BlockRow::new_done(full_hash(&b.entry.hash()[..])).into_row()); // mark block as "indexed"
-                    rows
-                })
-                .flatten()
-                .collect()
+            let added_blockhashes = self.store.added_blockhashes.read().unwrap();
+            for b in blocks {
+                let blockhash = b.entry.hash();
+                if !added_blockhashes.contains(blockhash) {
+                    panic!("cannot index block {} (missing from store)", blockhash);
+                }
+            }
+            index_blocks(blocks, &previous_txos_map, &self.iconfig)
         };
         rows
     }
@@ -1617,7 +1497,7 @@ fn add_blocks(block_entries: &[BlockEntry], iconfig: &IndexerConfig) -> Vec<DBRo
 
 fn add_transaction(txid: Txid, tx: &Transaction, rows: &mut Vec<DBRow>, iconfig: &IndexerConfig) {
     if !iconfig.light_mode {
-        rows.push(TxRow::new(tx).into_row());
+        rows.push(TxRow::new(txid, tx).into_row());
     }
 
     let txid = full_hash(&txid[..]);
@@ -1786,7 +1666,45 @@ fn index_transaction(
             rows.push(history.into_row());
         }
     }
+    for (txi_index, txi) in tx.input.iter().enumerate() {
+        if !has_prevout(txi) {
+            continue;
+        }
+        let prev_txo = previous_txos_map.get(&txi.previous_output).unwrap_or_else(|| {
+            panic!("missing previous txo {}", txi.previous_output)
+        });
 
+        let history = TxHistoryRow::new(
+            &prev_txo.script_pubkey,
+            confirmed_height,
+            TxHistoryInfo::Spending(SpendingInfo {
+                txid,
+                vin: txi_index as u16,
+                prev_txid: full_hash(&txi.previous_output.txid[..]),
+                prev_vout: txi.previous_output.vout as u16,
+                value: prev_txo.value.amount_value(),
+            }),
+        );
+        rows.push(history.into_row());
+
+        let edge = TxEdgeRow::new(
+            full_hash(&txi.previous_output.txid[..]),
+            txi.previous_output.vout as u16,
+            txid,
+            txi_index as u16,
+            confirmed_height,
+        );
+        rows.push(edge.into_row());
+    }
+
+    #[cfg(feature = "liquid")]
+    asset::index_confirmed_tx_assets(
+        tx,
+        confirmed_height,
+        iconfig.network,
+        iconfig.parent_network,
+        rows,
+    );
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1896,9 +1814,8 @@ struct TxRow {
 }
 
 impl TxRow {
-    fn new(txn: &Transaction) -> TxRow {
-        #[allow(deprecated)]
-        let txid = full_hash(&txn.txid()[..]);
+    fn new(txid: Txid, txn: &Transaction) -> TxRow {
+        let txid = full_hash(&txid[..]);
         TxRow {
             key: TxRowKey { code: b'T', txid },
             value: serialize(txn),

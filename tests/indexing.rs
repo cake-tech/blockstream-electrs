@@ -9,7 +9,7 @@ use common::Result;
 fn test_indexing_sync_and_state() -> Result<()> {
     // TestRunner::new() mines 101 blocks and runs indexer.update() once
     let tester = common::TestRunner::new()?;
-    let store = tester.query.chain().store();
+    let store = tester.store();
 
     // Indexing completed: tip is persisted
     assert!(
@@ -49,7 +49,7 @@ fn test_sp_tweak_indexing() -> Result<()> {
     // With silent-payments and sp_begin_height=0, skip_tweaks=false in test config,
     // tweak indexing runs on regtest blocks
     let tester = common::TestRunner::new()?;
-    let store = tester.query.chain().store();
+    let store = tester.store();
 
     let tweaked = store.tweaked_blockhashes();
     // Regtest may have few or no P2TR outputs in first 101 blocks; we only check the path ran
@@ -61,11 +61,12 @@ fn test_sp_tweak_indexing() -> Result<()> {
     );
 
     // SP APIs should not panic: block_tweaks and tweaks_iter_scan for a valid height
-    let sp_begin = tester.query.sp_begin_height();
-    let best_height = tester.query.chain().best_header().height();
+    let q = tester.query();
+    let sp_begin = q.sp_begin_height();
+    let best_height = q.chain().best_header().height();
     let height = (sp_begin as usize).min(best_height);
-    let _ = tester.query.block_tweaks(height);
-    let _ = tester.query.tweaks_iter_scan(sp_begin, sp_begin + 1);
+    let _ = q.block_tweaks(height);
+    let _ = q.tweaks_iter_scan(sp_begin, sp_begin + 1);
 
     Ok(())
 }
@@ -74,7 +75,7 @@ fn test_sp_tweak_indexing() -> Result<()> {
 fn test_indexing_after_new_block() -> Result<()> {
     // Mine one more block and sync; index state should update
     let mut tester = common::TestRunner::new()?;
-    let store = tester.query.chain().store();
+    let store = tester.store();
     let indexed_before = store.indexed_blockhashes().len();
 
     tester.mine()?;

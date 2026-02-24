@@ -218,6 +218,14 @@ impl TestRunner {
         return &self.node.client();
     }
 
+    pub fn store(&self) -> &electrs::new_index::Store {
+        self.query.chain().store()
+    }
+
+    pub fn query(&self) -> &electrs::new_index::Query {
+        &self.query
+    }
+
     pub fn sync(&mut self) -> Result<()> {
         let tip = self.indexer.update(&self.daemon)?;
         assert!(Mempool::update(&self.mempool, &self.daemon, &tip)?);

@@ -521,8 +521,95 @@ impl Indexer {
     }
 
     fn index(&self, blocks: &[BlockEntry]) {
-        // Indexed blockhashes are tracked in the history_db via BlockRow::done_filter()
-        // No need to maintain a separate in-memory set
+        let rows = {
+            let _timer = self.start_timer("index_process");
+            blocks
+                .par_iter() // serialization is CPU-intensive
+                .map(|b| {
+                    let height = b.entry.height() as u32;
+                    debug!("indexing block {}", height);
+
+                    let mut rows = vec![];
+                    for tx in &b.block.txdata {
+                        let txid = full_hash(&tx.txid()[..]);
+                        // persist history index:
+                        //      H{funding-scripthash}{funding-height}F{funding-txid:vout} → ""
+                        //      H{funding-scripthash}{spending-height}S{spending-txid:vin}{funding-txid:vout} → ""
+                        // persist "edges" for fast is-this-TXO-spent check
+                        //      S{funding-txid:vout}{spending-txid:vin} → ""
+                        for (txo_index, txo) in tx.output.iter().enumerate() {
+                            if is_spendable(txo) || self.iconfig.index_unspendables {
+                                let history = TxHistoryRow::new(
+                                    &txo.script_pubkey,
+                                    height,
+                                    TxHistoryInfo::Funding(FundingInfo {
+                                        txid,
+                                        vout: txo_index as u16,
+                                        value: txo.value.amount_value(),
+                                    }),
+                                );
+                                rows.push(history.into_row());
+
+                                // for prefix address search, only saved when --address-search is enabled
+                                //      a{funding-address-str} → ""
+                                if self.iconfig.address_search {
+                                    if let Some(row) =
+                                        addr_search_row(&txo.script_pubkey, self.iconfig.network)
+                                    {
+                                        rows.push(row);
+                                    }
+                                }
+                            }
+                        }
+                        for (txi_index, txi) in tx.input.iter().enumerate() {
+                            if !has_prevout(txi) {
+                                continue;
+                            }
+                            let prev_txo = lookup_txo(&self.store.txstore_db, &txi.previous_output)
+                                .unwrap_or_else(|| {
+                                    panic!("missing previous txo {}", txi.previous_output)
+                                });
+
+                            let history = TxHistoryRow::new(
+                                &prev_txo.script_pubkey,
+                                height,
+                                TxHistoryInfo::Spending(SpendingInfo {
+                                    txid,
+                                    vin: txi_index as u16,
+                                    prev_txid: full_hash(&txi.previous_output.txid[..]),
+                                    prev_vout: txi.previous_output.vout as u16,
+                                    value: prev_txo.value.amount_value(),
+                                }),
+                            );
+                            rows.push(history.into_row());
+
+                            let edge = TxEdgeRow::new(
+                                full_hash(&txi.previous_output.txid[..]),
+                                txi.previous_output.vout as u16,
+                                txid,
+                                txi_index as u16,
+                            );
+                            rows.push(edge.into_row());
+                        }
+
+                        // Index issued assets & native asset pegins/pegouts/burns
+                        #[cfg(feature = "liquid")]
+                        asset::index_confirmed_tx_assets(
+                            tx,
+                            height,
+                            self.iconfig.network,
+                            self.iconfig.parent_network,
+                            &mut rows,
+                        );
+                    }
+
+                    rows.push(BlockRow::new_done(full_hash(&b.entry.hash()[..])).into_row()); // mark block as "indexed"
+                    rows
+                })
+                .flatten()
+                .collect()
+        };
+        self.store.history_db.write(rows, self.flush);
     }
 
     // Undo the history db entries previously written for the given blocks (that were reorged).

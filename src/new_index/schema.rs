@@ -2,7 +2,7 @@ use bitcoin::hashes::sha256d::Hash as Sha256dHash;
 use bitcoin::hex::FromHex;
 #[cfg(not(feature = "liquid"))]
 use bitcoin::merkle_tree::MerkleBlock;
-use bitcoin::{Amount, Witness};
+use bitcoin::Amount;
 use crypto::digest::Digest;
 use crypto::sha2::Sha256;
 use hex;
@@ -625,7 +625,10 @@ impl Indexer {
 
         for (txo_index, txo) in tx.output.iter().enumerate() {
             if is_spendable(txo) {
-                let amount = (txo.value as Amount).to_sat();
+                #[cfg(not(feature = "liquid"))]
+                let amount = txo.value.to_sat();
+                #[cfg(feature = "liquid")]
+                let amount = txo.value.explicit().unwrap_or(0);
                 #[allow(deprecated)]
                 if txo.script_pubkey.is_p2tr()
                     && amount >= self.iconfig.sp_min_dust.unwrap_or(1_000) as u64
@@ -666,9 +669,13 @@ impl Indexer {
 
             let prev_txo = lookup_txo(&self.store.txstore_db, &txin.previous_output);
             if let Some(prev_txo) = prev_txo {
+                #[cfg(not(feature = "liquid"))]
+                let witness_vec = txin.witness.to_vec();
+                #[cfg(feature = "liquid")]
+                let witness_vec = txin.witness.script_witness.clone();
                 match get_pubkey_from_input(
                     &txin.script_sig.to_bytes(),
-                    &(txin.witness.clone() as Witness).to_vec(),
+                    &witness_vec,
                     &prev_txo.script_pubkey.to_bytes(),
                 ) {
                     Ok(Some(pubkey)) => pubkeys.push(pubkey),

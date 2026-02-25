@@ -40,7 +40,7 @@ use crate::new_index::db::{DBFlush, DBRow, ReverseScanIterator, ScanIterator, DB
 use crate::new_index::fetch::{start_fetcher, BlockEntry, FetchFrom};
 
 #[cfg(feature = "liquid")]
-use crate::elements::{asset, ebcompact::TxidCompat, peg};
+use crate::elements::{asset, ebcompact::{ScriptMethods, TxidCompat}, peg};
 
 #[cfg(feature = "liquid")]
 use elements::encode::VarInt;

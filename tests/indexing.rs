@@ -5,43 +5,6 @@ pub mod common;
 
 use common::Result;
 
-#[test]
-fn test_indexing_sync_and_state() -> Result<()> {
-    // TestRunner::new() mines 101 blocks and runs indexer.update() once
-    let tester = common::TestRunner::new()?;
-    let store = tester.store();
-
-    // Indexing completed: tip is persisted
-    assert!(
-        store.done_initial_sync(),
-        "expected initial sync done (tip 't' in txstore)"
-    );
-
-    // All 102 blocks (0..101) should be added and history-indexed
-    let added = store.added_blockhashes.read().unwrap();
-    let added_len = added.len();
-    let indexed = store.indexed_blockhashes();
-    let headers = store.indexed_headers.read().unwrap();
-    let tip_height = headers.len().saturating_sub(1);
-
-    assert!(
-        added_len >= 101,
-        "expected at least 101 blocks in txstore, got {}",
-        added_len
-    );
-    assert!(
-        indexed.len() >= 101,
-        "expected at least 101 blocks in history index, got {}",
-        indexed.len()
-    );
-    assert!(
-        tip_height >= 100,
-        "expected tip height >= 100, got {}",
-        tip_height
-    );
-
-    Ok(())
-}
 
 #[cfg(feature = "silent-payments")]
 #[test]

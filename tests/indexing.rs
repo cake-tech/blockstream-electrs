@@ -75,6 +75,9 @@ fn test_sp_tweak_indexing() -> Result<()> {
 fn test_indexing_after_new_block() -> Result<()> {
     // Mine one more block and sync; index state should update
     let mut tester = common::TestRunner::new()?;
+    // Ensure indexed_headers is populated so the next update (after mine) uses the
+    // incremental path instead of get_all_headers.
+    tester.sync()?;
     let indexed_before = tester.store().indexed_blockhashes().len();
 
     tester.mine()?;

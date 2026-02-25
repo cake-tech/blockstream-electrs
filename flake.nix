@@ -58,7 +58,11 @@
             inherit src buildInputs nativeBuildInputs;
           } // envVars;
 
-          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+          # Build deps for all features (including silent-payments) so vendored/cached
+          # crates include bech32 0.9.1 required by silentpayments.
+          cargoArtifacts = craneLib.buildDepsOnly (commonArgs // {
+            cargoExtraArgs = "--all-features";
+          });
           bin = craneLib.buildPackage (commonArgs // {
             inherit cargoArtifacts;
           });

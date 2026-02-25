@@ -76,8 +76,18 @@ fn test_indexing_after_new_block() -> Result<()> {
     // Mine one more block and sync; index state should update
     let mut tester = common::TestRunner::new()?;
     // Ensure indexed_headers is populated so the next update (after mine) uses the
-    // incremental path instead of get_all_headers.
+    // incremental path instead of get_all_headers (which can panic if parallel
+    // getblockheaders returns out-of-order; daemon is unchanged from new_index).
     tester.sync()?;
+
+    let headers_len = tester.store().indexed_headers.read().unwrap().len();
+    assert!(
+        headers_len >= 101,
+        "indexed_headers should be populated after initial sync (got {}); \
+         if the first update() failed or did not append, the next update would use get_all_headers",
+        headers_len
+    );
+
     let indexed_before = tester.store().indexed_blockhashes().len();
 
     tester.mine()?;

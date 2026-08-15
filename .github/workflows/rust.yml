@@ -16,8 +16,8 @@ jobs:
     - uses: actions/checkout@v4
     - uses: dtolnay/rust-toolchain@1.75.0
     - uses: Swatinem/rust-cache@v2
-    - name: Run cargo check --all-targets
-      run: cargo check --all-targets
+    - name: Run cargo check --locked --all-targets
+      run: cargo check --locked --all-targets
 
   test:
     runs-on: ubuntu-22.04

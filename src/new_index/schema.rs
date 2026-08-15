@@ -2,9 +2,10 @@ use bitcoin::hashes::sha256d::Hash as Sha256dHash;
 use bitcoin::hex::FromHex;
 #[cfg(not(feature = "liquid"))]
 use bitcoin::merkle_tree::MerkleBlock;
-
+use bitcoin::Amount;
 use crypto::digest::Digest;
 use crypto::sha2::Sha256;
+use hex;
 use itertools::Itertools;
 use rayon::prelude::*;
 
@@ -16,9 +17,11 @@ use elements::{
     encode::{deserialize, serialize},
     AssetId,
 };
+use silentpayments::utils::receiving::{calculate_tweak_data, get_pubkey_from_input};
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::convert::TryInto;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 
 use crate::{chain::{
@@ -37,7 +40,7 @@ use crate::new_index::db::{DBFlush, DBRow, ReverseScanIterator, ScanIterator, DB
 use crate::new_index::fetch::{start_fetcher, BlockEntry, FetchFrom};
 
 #[cfg(feature = "liquid")]
-use crate::elements::{asset, ebcompact::TxidCompat, peg};
+use crate::elements::{asset, ebcompact::{ScriptMethods, TxidCompat}, peg};
 
 #[cfg(feature = "liquid")]
 use elements::encode::VarInt;
@@ -46,15 +49,17 @@ use elements::encode::VarInt;
 use bitcoin::VarInt;
 
 const MIN_HISTORY_ITEMS_TO_CACHE: usize = 100;
+pub const MIN_SP_TWEAK_HEIGHT: usize = 823_807; // 01/01/2024
 
 pub struct Store {
     // TODO: should be column families
     txstore_db: DB,
     history_db: DB,
+    tweak_db: DB,
     cache_db: DB,
-    added_blockhashes: RwLock<HashSet<BlockHash>>,
+    pub added_blockhashes: RwLock<HashSet<BlockHash>>,
     indexed_blockhashes: RwLock<HashSet<BlockHash>>,
-    indexed_headers: RwLock<HeaderList>,
+    pub indexed_headers: RwLock<HeaderList>,
 }
 
 impl Store {
@@ -66,6 +71,7 @@ impl Store {
         debug!("{} blocks were added", added_blockhashes.len());
 
         let history_db = DB::open(&path.join("history"), config, verify_compat);
+        let tweak_db = DB::open(&path.join("tweak"), config, verify_compat);
         let indexed_blockhashes = load_blockhashes(&history_db, &BlockRow::done_filter());
         debug!("{} blocks were indexed", indexed_blockhashes.len());
 
@@ -105,6 +111,7 @@ impl Store {
         Store {
             txstore_db,
             history_db,
+            tweak_db,
             cache_db,
             added_blockhashes: RwLock::new(added_blockhashes),
             indexed_blockhashes: RwLock::new(indexed_blockhashes),
@@ -120,6 +127,10 @@ impl Store {
         &self.history_db
     }
 
+    pub fn tweak_db(&self) -> &DB {
+        &self.tweak_db
+    }
+
     pub fn cache_db(&self) -> &DB {
         &self.cache_db
     }
@@ -130,6 +141,16 @@ impl Store {
 
     pub fn done_initial_sync(&self) -> bool {
         self.txstore_db.get(b"t").is_some()
+    }
+
+    pub fn indexed_blockhashes(&self) -> HashSet<BlockHash> {
+        self.indexed_blockhashes.read().unwrap().clone()
+    }
+
+    pub fn tweaked_blockhashes(&self) -> HashSet<BlockHash> {
+        let tweaked_blockhashes = load_blockhashes(&self.tweak_db, &BlockRow::done_filter());
+        debug!("{} blocks were sp tweaked", tweaked_blockhashes.len());
+        tweaked_blockhashes
     }
 }
 
@@ -159,7 +180,7 @@ impl From<&Utxo> for OutPoint {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SpendingInput {
     pub txid: Txid,
     pub vin: u32,
@@ -207,6 +228,11 @@ struct IndexerConfig {
     network: Network,
     #[cfg(feature = "liquid")]
     parent_network: crate::chain::BNetwork,
+    sp_begin_height: Option<usize>,
+    sp_min_dust: Option<usize>,
+    sp_check_spends: bool,
+    skip_history: bool,
+    skip_tweaks: bool,
 }
 
 impl From<&Config> for IndexerConfig {
@@ -218,6 +244,11 @@ impl From<&Config> for IndexerConfig {
             network: config.network_type,
             #[cfg(feature = "liquid")]
             parent_network: config.parent_network,
+            sp_begin_height: config.sp_begin_height,
+            sp_min_dust: config.sp_min_dust,
+            sp_check_spends: config.sp_check_spends,
+            skip_history: config.skip_history,
+            skip_tweaks: config.skip_tweaks,
         }
     }
 }
@@ -259,11 +290,22 @@ impl Indexer {
             .collect()
     }
 
-    fn headers_to_index(&self, new_headers: &[HeaderEntry]) -> Vec<HeaderEntry> {
-        let indexed_blockhashes = self.store.indexed_blockhashes.read().unwrap();
-        new_headers
+    fn headers_to_index(&mut self, new_headers: &[HeaderEntry]) -> Vec<HeaderEntry> {
+        let indexed_blockhashes = self.store.indexed_blockhashes();
+        self.get_headers_to_use(indexed_blockhashes.len(), new_headers, 0)
             .iter()
             .filter(|e| !indexed_blockhashes.contains(e.hash()))
+            .cloned()
+            .collect()
+    }
+
+    fn headers_to_tweak(&mut self, new_headers: &[HeaderEntry]) -> Vec<HeaderEntry> {
+        let tweaked_blockhashes = self.store.tweaked_blockhashes();
+        let start_height = self.iconfig.sp_begin_height.unwrap_or(MIN_SP_TWEAK_HEIGHT);
+
+        self.get_headers_to_use(tweaked_blockhashes.len(), new_headers, start_height)
+            .iter()
+            .filter(|e| !tweaked_blockhashes.contains(e.hash()) && e.height() >= start_height)
             .cloned()
             .collect()
     }
@@ -293,10 +335,42 @@ impl Indexer {
         Ok((new_headers, reorged_since))
     }
 
+    fn get_all_indexed_headers(&self) -> Result<Vec<HeaderEntry>> {
+        let headers = self.store.indexed_headers.read().unwrap();
+        let all_headers = headers.iter().cloned().collect::<Vec<_>>();
+
+        Ok(all_headers)
+    }
+
+    fn get_headers_to_use(
+        &mut self,
+        lookup_len: usize,
+        new_headers: &[HeaderEntry],
+        start_height: usize,
+    ) -> Vec<HeaderEntry> {
+        let all_indexed_headers = self.get_all_indexed_headers().unwrap();
+        let count_total_indexed = all_indexed_headers.len() - start_height;
+
+        // Should have indexed more than what already has been indexed, use all headers
+        if count_total_indexed > lookup_len {
+            let count_left_to_index = lookup_len - count_total_indexed;
+
+            if let FetchFrom::BlkFiles = self.from {
+                if count_left_to_index < all_indexed_headers.len() / 2 {
+                    self.from = FetchFrom::BlkFilesReverse;
+                }
+            }
+
+            return all_indexed_headers;
+        } else {
+            // Just needs to index new headers
+            return new_headers.to_vec();
+        }
+    }
+
     pub fn update(&mut self, daemon: &Daemon) -> Result<BlockHash> {
         let daemon = daemon.reconnect()?;
         let tip = daemon.getbestblockhash()?;
-
         let (new_headers, reorged_since) = self.get_new_headers(&daemon, &tip)?;
 
         // Handle reorgs by undoing the reorged (stale) blocks first
@@ -335,20 +409,21 @@ impl Indexer {
 
         // Add new blocks to the txstore db
         let to_add = self.headers_to_add(&new_headers);
-        debug!(
-            "adding transactions from {} blocks using {:?}",
-            to_add.len(),
-            self.from
-        );
+        if !to_add.is_empty() {
+            debug!(
+                "adding transactions from {} blocks using {:?}",
+                to_add.len(),
+                self.from
+            );
 
-        let mut fetcher_count = 0;
-        let mut blocks_fetched = 0;
-        let to_add_total = to_add.len();
+            let mut fetcher_count = 0;
+            let mut blocks_fetched = 0;
+            let to_add_total = to_add.len();
 
-        start_fetcher(self.from, &daemon, to_add)?.map(|blocks|
-            {
+            start_fetcher(self.from, &daemon, to_add)?.map(|blocks| {
                 if fetcher_count % 25 == 0 && to_add_total > 20 {
-                    info!("adding txes from blocks {}/{} ({:.1}%)",
+                    info!(
+                        "adding txes from blocks {}/{} ({:.1}%)",
                         blocks_fetched,
                         to_add_total,
                         blocks_fetched as f32 / to_add_total as f32 * 100.0
@@ -359,19 +434,45 @@ impl Indexer {
 
                 self.add(&blocks)
             });
-
-        self.start_auto_compactions(&self.store.txstore_db);
+            self.start_auto_compactions(&self.store.txstore_db());
+        }
 
         // Index new blocks to the history db
-        let to_index = self.headers_to_index(&new_headers);
-        debug!(
-            "indexing history from {} blocks using {:?}",
-            to_index.len(),
-            self.from
-        );
-        start_fetcher(self.from, &daemon, to_index)?.map(|blocks| self.index(&blocks));
-        self.start_auto_compactions(&self.store.history_db);
-        self.start_auto_compactions(&self.store.cache_db);
+        if !self.iconfig.skip_history {
+            let to_index = self.headers_to_index(&new_headers);
+            if !to_index.is_empty() {
+                debug!(
+                    "indexing history from {} blocks using {:?}",
+                    to_index.len(),
+                    self.from
+                );
+                start_fetcher(self.from, &daemon, to_index)?.map(|blocks| self.index(&blocks));
+                self.start_auto_compactions(&self.store.history_db);
+                self.start_auto_compactions(&self.store.cache_db);
+            }
+        } else {
+            debug!("Skipping history indexing");
+        }
+
+        if !self.iconfig.skip_tweaks {
+            let to_tweak = self.headers_to_tweak(&new_headers);
+            if !to_tweak.is_empty() {
+                debug!(
+                    "indexing sp tweaks from {} blocks using {:?}",
+                    to_tweak.len(),
+                    self.from
+                );
+
+                let total = to_tweak.len();
+                let count = Arc::new(AtomicUsize::new(0));
+
+                start_fetcher(self.from, &daemon, to_tweak)?
+                    .map(|blocks| self.tweak(&blocks, total, &count));
+                self.start_auto_compactions(&self.store.tweak_db());
+            }
+        } else {
+            debug!("Skipping tweaks indexing");
+        }
 
         if let DBFlush::Disable = self.flush {
             debug!("flushing to disk");
@@ -395,6 +496,8 @@ impl Indexer {
         }
 
         self.tip_metric.set(headers.best_height() as i64);
+
+        debug!("finished Indexer update");
 
         Ok(tip)
     }
@@ -458,7 +561,6 @@ impl Indexer {
             let added_blockhashes = self.store.added_blockhashes.read().unwrap();
             for b in blocks {
                 let blockhash = b.entry.hash();
-                // TODO: replace by lookup into txstore_db?
                 if !added_blockhashes.contains(blockhash) {
                     panic!("cannot index block {} (missing from store)", blockhash);
                 }
@@ -468,8 +570,169 @@ impl Indexer {
         rows
     }
 
+    fn tweak(&self, blocks: &[BlockEntry], total: usize, count: &Arc<AtomicUsize>) {
+        let rows = {
+            let _timer = self.start_timer("tweak_process");
+            blocks
+                .par_iter() // serialization is CPU-intensive
+                .map(|b| {
+                    let mut rows = vec![];
+                    let mut tweaks: Vec<Vec<u8>> = vec![];
+                    let blockhash = full_hash(&b.entry.hash()[..]);
+                    let blockheight = b.entry.height();
+
+                    for tx in &b.block.txdata {
+                        self.tweak_transaction(
+                            blockheight.try_into().unwrap(),
+                            tx,
+                            &mut rows,
+                            &mut tweaks,
+                        );
+                    }
+
+                    // persist block tweaks index:
+                    //      W{blockhash} → {tweak1}...{tweakN}
+                    rows.push(BlockRow::new_tweaks(blockhash, &tweaks).into_row());
+                    rows.push(BlockRow::new_done(blockhash).into_row());
+
+                    count.fetch_add(1, Ordering::SeqCst);
+                    info!(
+                        "Sp tweaked block {} of {} total (height: {})",
+                        count.load(Ordering::SeqCst),
+                        total,
+                        b.entry.height()
+                    );
+
+                    rows
+                })
+                .flatten()
+                .collect()
+        };
+
+        self.store.tweak_db().write_rows(rows, self.flush);
+        self.store.tweak_db().flush();
+    }
+
+    fn tweak_transaction(
+        &self,
+        blockheight: u32,
+        tx: &Transaction,
+        rows: &mut Vec<DBRow>,
+        tweaks: &mut Vec<Vec<u8>>,
+    ) {
+        let txid = &tx.compute_txid();
+        let mut output_pubkeys: Vec<VoutData> = Vec::with_capacity(tx.output.len());
+
+        for (txo_index, txo) in tx.output.iter().enumerate() {
+            if is_spendable(txo) {
+                #[cfg(not(feature = "liquid"))]
+                let amount = txo.value.to_sat();
+                #[cfg(feature = "liquid")]
+                let amount = txo.value.explicit().unwrap_or(0);
+                #[allow(deprecated)]
+                if txo.script_pubkey.is_p2tr()
+                    && amount >= self.iconfig.sp_min_dust.unwrap_or(1_000) as u64
+                {
+                    output_pubkeys.push(VoutData {
+                        vout: txo_index,
+                        amount,
+                        script_pubkey: txo.script_pubkey.clone(),
+                        spending_input: if self.iconfig.sp_check_spends {
+                            self.lookup_spend(&OutPoint {
+                                txid: txid.clone(),
+                                vout: txo_index as u32,
+                            })
+                        } else {
+                            None
+                        },
+                    });
+                }
+            }
+        }
+
+        if output_pubkeys.is_empty() {
+            return;
+        }
+
+        let mut pubkeys = Vec::with_capacity(tx.input.len());
+        let mut outpoints = Vec::with_capacity(tx.input.len());
+
+        for txin in tx.input.iter() {
+            let prev_txid = txin.previous_output.txid;
+            let prev_vout = txin.previous_output.vout;
+
+            // Collect outpoints from all of the inputs, not just the silent payment eligible
+            // inputs. This is relevant for transactions that have a mix of silent payments
+            // eligible and non-eligible inputs, where the smallest outpoint is for one of the
+            // non-eligible inputs
+            outpoints.push((prev_txid.to_string(), prev_vout));
+
+            let prev_txo = lookup_txo(&self.store.txstore_db, &txin.previous_output);
+            if let Some(prev_txo) = prev_txo {
+                #[cfg(not(feature = "liquid"))]
+                let witness_vec = txin.witness.to_vec();
+                #[cfg(feature = "liquid")]
+                let witness_vec = txin.witness.script_witness.clone();
+                match get_pubkey_from_input(
+                    &txin.script_sig.to_bytes(),
+                    &witness_vec,
+                    &prev_txo.script_pubkey.to_bytes(),
+                ) {
+                    Ok(Some(pubkey)) => pubkeys.push(pubkey),
+                    Ok(None) => (),
+                    Err(_e) => {}
+                }
+            }
+        }
+
+        let pubkeys_ref: Vec<_> = pubkeys.iter().collect();
+        if !pubkeys_ref.is_empty() {
+            if let Some(tweak) = calculate_tweak_data(&pubkeys_ref, &outpoints).ok() {
+                // persist tweak index:
+                //      K{blockhash}{txid} → {tweak}{serialized-vout-data}
+                rows.push(
+                    TweakTxRow::new(
+                        blockheight,
+                        txid.clone(),
+                        &TweakData {
+                            tweak: hex::encode(tweak.serialize()),
+                            vout_data: output_pubkeys.clone(),
+                        },
+                    )
+                    .into_row(),
+                );
+                tweaks.push(tweak.serialize().to_vec());
+            }
+        }
+    }
+
     pub fn fetch_from(&mut self, from: FetchFrom) {
         self.from = from;
+    }
+
+    pub fn tx_confirming_block(&self, txid: &Txid) -> Option<BlockId> {
+        let _timer = self.start_timer("tx_confirming_block");
+        let row_value = self.store.history_db.get(&TxConfRow::key(txid))?;
+        let height = TxConfRow::height_from_val(&row_value);
+        let headers = self.store.indexed_headers.read().unwrap();
+        // skip over entries that point to non-existing heights (may happen while new/reorged blocks are being processed)
+        Some(headers.header_by_height(height as usize)?.into())
+    }
+
+    pub fn lookup_spend(&self, outpoint: &OutPoint) -> Option<SpendingInput> {
+        let _timer = self.start_timer("lookup_spend");
+        self.store
+            .history_db
+            .iter_scan(&TxEdgeRow::filter(&outpoint))
+            .map(TxEdgeRow::from_row)
+            .find_map(|edge| {
+                let txid: Txid = deserialize(&edge.value.spending_txid).unwrap();
+                self.tx_confirming_block(&txid).map(|b| SpendingInput {
+                    txid,
+                    vin: edge.value.spending_vin as u32,
+                    confirmed: Some(b),
+                })
+            })
     }
 }
 
@@ -683,6 +946,34 @@ impl ChainQuery {
             .filter_map(|(txid, height)| Some((txid, headers.header_by_height(height)?.into())))
             .take(limit)
             .collect()
+    }
+
+    pub fn store_tweak_cache_height(&self, height: u32, tip: u32) {
+        let row = TweakBlockRecordCacheRow::new(height, tip).into_row();
+        self.store.tweak_db.put_sync(&row.key, &row.value);
+    }
+
+    pub fn get_tweak_cached_height(&self, height: u32) -> Option<u32> {
+        self.store
+            .tweak_db
+            .iter_scan(&TweakBlockRecordCacheRow::key(height))
+            .map(|v| TweakBlockRecordCacheRow::from_row(v).value)
+            .next()
+    }
+
+    pub fn tweaks_iter_scan_reverse(&self, height: u32) -> ReverseScanIterator {
+        self.store.tweak_db.iter_scan_reverse(
+            &TweakTxRow::filter(),
+            &TweakTxRow::prefix_blockheight(height),
+        )
+    }
+
+    pub fn tweaks_iter_scan(&self, start_height: u32, end_height: u32) -> ScanIterator {
+        self.store.tweak_db.iter_scan_range(
+            &TweakTxRow::filter(),
+            &TweakTxRow::prefix_blockheight(start_height),
+            &TweakTxRow::prefix_blockheight(end_height),
+        )
     }
 
     // TODO: avoid duplication with stats/stats_delta?
@@ -931,6 +1222,22 @@ impl ChainQuery {
             .cloned()
     }
 
+    pub fn get_block_tweaks(&self, hash: &BlockHash) -> Vec<String> {
+        let _timer = self.start_timer("get_block_tweaks");
+
+        let tweaks: Vec<Vec<u8>> = self
+            .store
+            .tweak_db
+            .get(&BlockRow::tweaks_key(full_hash(&hash[..])))
+            .map(|val| bincode::deserialize_little(&val).expect("failed to parse block tweaks"))
+            .unwrap();
+
+        tweaks
+            .into_iter()
+            .map(|tweak| hex::encode(tweak))
+            .collect()
+    }
+
     pub fn hash_by_height(&self, height: usize) -> Option<BlockHash> {
         self.store
             .indexed_headers
@@ -1022,7 +1329,7 @@ impl ChainQuery {
             // TODO fetch transaction as binary from REST API instead of as hex
             let txval = self
                 .daemon
-                .gettransaction_raw(txid, blockhash, false)
+                .gettransaction_raw(txid, Some(blockhash), false)
                 .ok()?;
             let txhex = txval.as_str().expect("valid tx from bitcoind");
             Some(Bytes::from_hex(txhex).expect("valid tx from bitcoind"))
@@ -1174,8 +1481,11 @@ fn add_blocks(block_entries: &[BlockEntry], iconfig: &IndexerConfig) -> Vec<DBRo
         .map(|b| {
             let mut rows = vec![];
             let blockhash = full_hash(&b.entry.hash()[..]);
+            let height = b.entry.height() as u32;
             let txids: Vec<Txid> = b.block.txdata.iter().map(|tx| tx.compute_txid()).collect();
             for (tx, txid) in b.block.txdata.iter().zip(txids.iter()) {
+                let txid_hash = full_hash(&txid[..]);
+                rows.push(TxConfRow::new(txid_hash, height).into_row());
                 add_transaction(*txid, tx, &mut rows, iconfig);
             }
 
@@ -1211,7 +1521,7 @@ fn add_transaction(txid: Txid, tx: &Transaction, rows: &mut Vec<DBRow>, iconfig:
     }
 }
 
-fn get_previous_txos(block_entries: &[BlockEntry]) -> BTreeSet<OutPoint> {
+pub fn get_previous_txos(block_entries: &[BlockEntry]) -> BTreeSet<OutPoint> {
     block_entries
         .iter()
         .flat_map(|b| b.block.txdata.iter())
@@ -1224,7 +1534,10 @@ fn get_previous_txos(block_entries: &[BlockEntry]) -> BTreeSet<OutPoint> {
         .collect()
 }
 
-fn lookup_txos(txstore_db: &DB, outpoints: BTreeSet<OutPoint>) -> Result<HashMap<OutPoint, TxOut>> {
+pub fn lookup_txos(
+    txstore_db: &DB,
+    outpoints: BTreeSet<OutPoint>,
+) -> Result<HashMap<OutPoint, TxOut>> {
     let keys = outpoints.iter().map(TxOutRow::key).collect::<Vec<_>>();
     txstore_db
         .multi_get(keys)
@@ -1243,6 +1556,51 @@ fn lookup_txo(txstore_db: &DB, outpoint: &OutPoint) -> Option<TxOut> {
     txstore_db
         .get(&TxOutRow::key(&outpoint))
         .map(|val| deserialize(&val).expect("failed to parse TxOut"))
+}
+
+#[derive(Serialize, Deserialize)]
+struct TweakBlockRecordCacheKey {
+    code: u8,
+    height: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TweakBlockRecordCacheRow {
+    key: TweakBlockRecordCacheKey,
+    value: u32, // last_height when the tweak cache was updated
+}
+
+impl TweakBlockRecordCacheRow {
+    pub fn new(height: u32, tip: u32) -> TweakBlockRecordCacheRow {
+        TweakBlockRecordCacheRow {
+            key: TweakBlockRecordCacheKey {
+                code: TweakBlockRecordCacheRow::code(),
+                height,
+            },
+            value: tip,
+        }
+    }
+
+    pub fn code() -> u8 {
+        b'T'
+    }
+
+    pub fn into_row(self) -> DBRow {
+        DBRow {
+            key: bincode::serialize_big(&self.key).unwrap(),
+            value: bincode::serialize_big(&self.value).unwrap(),
+        }
+    }
+
+    pub fn key(height: u32) -> Bytes {
+        bincode::serialize_big(&(TweakBlockRecordCacheRow::code(), height)).unwrap()
+    }
+
+    pub fn from_row(row: DBRow) -> TweakBlockRecordCacheRow {
+        let key: TweakBlockRecordCacheKey = bincode::deserialize_big(&row.key).unwrap();
+        let value: u32 = bincode::deserialize_big(&row.value).unwrap();
+        TweakBlockRecordCacheRow { key, value }
+    }
 }
 
 pub fn lookup_confirmations(
@@ -1319,9 +1677,9 @@ fn index_transaction(
         if !has_prevout(txi) {
             continue;
         }
-        let prev_txo = previous_txos_map
-            .get(&txi.previous_output)
-            .unwrap_or_else(|| panic!("missing previous txo {}", txi.previous_output));
+        let prev_txo = previous_txos_map.get(&txi.previous_output).unwrap_or_else(|| {
+            panic!("missing previous txo {}", txi.previous_output)
+        });
 
         let history = TxHistoryRow::new(
             &prev_txo.script_pubkey,
@@ -1346,7 +1704,6 @@ fn index_transaction(
         rows.push(edge.into_row());
     }
 
-    // Index issued assets & native asset pegins/pegouts/burns
     #[cfg(feature = "liquid")]
     asset::index_confirmed_tx_assets(
         tx,
@@ -1355,6 +1712,75 @@ fn index_transaction(
         iconfig.parent_network,
         rows,
     );
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VoutData {
+    pub vout: usize,
+    pub amount: u64,
+    pub script_pubkey: Script,
+    pub spending_input: Option<SpendingInput>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TweakData {
+    pub tweak: String,
+    pub vout_data: Vec<VoutData>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct TweakTxKey {
+    code: u8,
+    pub blockheight: u32,
+    pub txid: Txid,
+}
+
+pub struct TweakTxRow {
+    pub key: TweakTxKey,
+    pub value: TweakData,
+}
+
+impl TweakTxRow {
+    pub fn new(blockheight: u32, txid: Txid, tweak: &TweakData) -> TweakTxRow {
+        TweakTxRow {
+            key: TweakTxKey {
+                code: TweakTxRow::code(),
+                blockheight,
+                txid,
+            },
+            value: tweak.clone(),
+        }
+    }
+
+    pub fn into_row(self) -> DBRow {
+        let TweakTxRow { key, value } = self;
+        DBRow {
+            key: bincode::serialize_big(&key).unwrap(),
+            value: bincode::serialize_big(&value).unwrap(),
+        }
+    }
+
+    pub fn from_row(row: DBRow) -> TweakTxRow {
+        let key: TweakTxKey = bincode::deserialize_big(&row.key).unwrap();
+        let value: TweakData = bincode::deserialize_big(&row.value).unwrap();
+        TweakTxRow { key, value }
+    }
+
+    pub fn code() -> u8 {
+        b'K'
+    }
+
+    fn filter() -> Bytes {
+        [TweakTxRow::code()].to_vec()
+    }
+
+    fn prefix_blockheight(height: u32) -> Bytes {
+        bincode::serialize_big(&(TweakTxRow::code(), height)).unwrap()
+    }
+
+    pub fn get_tweak_data(&self) -> TweakData {
+        self.value.clone()
+    }
 }
 
 fn addr_search_row(spk: &Script, network: Network) -> Option<DBRow> {
@@ -1453,6 +1879,7 @@ impl TxConfRow {
     fn height_from_val(val: &[u8]) -> u32 {
         u32::from_le_bytes(val.try_into().expect("invalid TxConf value"))
     }
+
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1531,6 +1958,20 @@ impl BlockRow {
         }
     }
 
+    pub fn tweaks_code() -> u8 {
+        b'W'
+    }
+
+    fn new_tweaks(hash: FullHash, tweaks: &[Vec<u8>]) -> BlockRow {
+        BlockRow {
+            key: BlockKey {
+                code: BlockRow::tweaks_code(),
+                hash,
+            },
+            value: bincode::serialize_little(tweaks).unwrap(),
+        }
+    }
+
     fn new_done(hash: FullHash) -> BlockRow {
         BlockRow {
             key: BlockKey { code: b'D', hash },
@@ -1548,6 +1989,10 @@ impl BlockRow {
 
     fn meta_key(hash: FullHash) -> Bytes {
         [b"M", &hash[..]].concat()
+    }
+
+    fn tweaks_key(hash: FullHash) -> Bytes {
+        [&[BlockRow::tweaks_code()], &hash[..]].concat()
     }
 
     fn done_filter() -> Bytes {
@@ -1738,6 +2183,16 @@ impl TxEdgeRow {
             .unwrap()
     }
 
+    fn filter(outpoint: &OutPoint) -> Bytes {
+        Self::key(outpoint)
+    }
+
+    fn from_row(row: DBRow) -> Self {
+        let key: TxEdgeKey = bincode::deserialize_little(&row.key).unwrap();
+        let value: TxEdgeValue = bincode::deserialize_little(&row.value).unwrap();
+        TxEdgeRow { key, value }
+    }
+
     pub fn into_row(self) -> DBRow {
         DBRow {
             key: bincode::serialize_little(&self.key).unwrap(),
@@ -1864,48 +2319,5 @@ impl GetAmountVal for bitcoin::Amount {
 impl GetAmountVal for confidential::Value {
     fn amount_value(self) -> confidential::Value {
         self
-    }
-}
-
-// This is needed to bench private functions
-#[cfg(feature = "bench")]
-pub mod bench {
-    use crate::new_index::schema::IndexerConfig;
-    use crate::new_index::BlockEntry;
-    use crate::new_index::DBRow;
-    use crate::util::HeaderEntry;
-    use bitcoin::Block;
-
-    pub struct Data {
-        block_entry: BlockEntry,
-        iconfig: IndexerConfig,
-    }
-
-    impl Data {
-        pub fn new(block: Block) -> Data {
-            let iconfig = IndexerConfig {
-                light_mode: false,
-                address_search: false,
-                index_unspendables: false,
-                network: crate::chain::Network::Regtest,
-            };
-            let height = 702861;
-            let hash = block.block_hash();
-            let header = block.header.clone();
-            let block_entry = BlockEntry {
-                block,
-                entry: HeaderEntry::new(height, hash, header),
-                size: 0u32, // wrong but not needed for benching
-            };
-
-            Data {
-                block_entry,
-                iconfig,
-            }
-        }
-    }
-
-    pub fn add_blocks(data: &Data) -> Vec<DBRow> {
-        super::add_blocks(&[data.block_entry.clone()], &data.iconfig)
     }
 }

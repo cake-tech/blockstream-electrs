@@ -8,12 +8,13 @@ The index is stored as three RocksDB databases:
 
 ### Indexing process
 
-The indexing is done in the two phase, where each can be done concurrently within itself.
-The first phase populates the `txstore` database, the second phase populates the `history` database.
+The indexing is done in three phases, where each can be done concurrently within itself.
+The first phase populates the `txstore` database, the second phase populates the `history` database, and the third populates the `tweak` database.
 
 NOTE: in order to construct the history rows for spending inputs in phase #2, we rely on having the transactions being processed at phase #1, so they can be looked up efficiently (using parallel point lookups).
 
 After the indexing is completed, both funding and spending are indexed as independent rows under `H{scripthash}`, so that they can be queried in-order in one go.
+
 
 ### `txstore`
 
@@ -59,6 +60,22 @@ Each spending input (except the coinbase) results in the following new rows (`S`
 Each block results in the following new row:
 
  * `"D{blockhash}" → ""` (signifies the block was indexed)
+
+#### Silent Payments only
+
+### `tweaks`
+
+Each block results in the following new rows:
+
+ * `"W{blockhash}" → "{tweak1}...{tweakN}"` (list of txids included in the block)
+
+Each transaction results in the following new rows:
+
+ * `"K{blockheight}{txid}" → "{tweak_data1}...{tweak_dataN}"` (txid -> tweak, and list of vout:amount:scripthash for each valid sp output)
+
+Every time a block is scanned for tweaks, the following row is updated:
+
+ * `"B{blockheight}" → "{tip}"` (the blockheight scanned -> the tip of the chain during scanning, this allows to cache the last tip and avoid running spent checks for the same block multiple times, until a new block comes in, then outputs need to be checked if they were spent the next time they are scanned)
 
 #### Elements only
 

@@ -56,8 +56,9 @@ fn usize_from_value(val: Option<&Value>, name: &str) -> Result<usize> {
 }
 
 /// Fast P2TR key extraction: OP_1 <32-byte xonly key> = 0x51 0x20 + 32 bytes.
-fn p2tr_pubkey_hex(script: &bitcoin::Script) -> Option<String> {
-    let bytes = script.as_bytes();
+/// Takes raw script bytes so it works with both bitcoin::Script and
+/// elements::Script (liquid builds).
+fn p2tr_pubkey_hex(bytes: &[u8]) -> Option<String> {
     if bytes.len() == 34 && bytes[0] == 0x51 && bytes[1] == 0x20 {
         Some(bytes[2..].as_hex().to_string())
     } else {
@@ -469,7 +470,7 @@ impl Connection {
                 // Fast path: P2TR scripts are OP_1 <32-byte xonly key>, so the
                 // pubkey hex is the last 32 bytes directly, avoiding the
                 // script-to-asm allocation + split done previously.
-                let pubkey_hex = p2tr_pubkey_hex(&vout.script_pubkey).or_else(|| {
+                let pubkey_hex = p2tr_pubkey_hex(vout.script_pubkey.as_bytes()).or_else(|| {
                     vout
                         .script_pubkey
                         .to_asm()

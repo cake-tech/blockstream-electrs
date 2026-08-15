@@ -388,12 +388,13 @@ impl Connection {
         // per dense block while keeping behavior identical.
         let mut block_cache_current: HashMap<u32, bool> = HashMap::new();
 
-        let rows: Vec<_> = self
-            .query
-            .tweaks_iter_scan(scan_height, final_scanned_height)
-            .collect();
-
-        for row in rows {
+        // Stream rows straight off the (snapshot-consistent) RocksDB iterator
+        // instead of collecting the entire requested range into memory first: a
+        // dense historical request can span hundreds of thousands of rows, and
+        // collecting delays the first streamed block until the whole range has
+        // been read. Cloning the Arc keeps `self` free for send_values().
+        let query = Arc::clone(&self.query);
+        for row in query.tweaks_iter_scan(scan_height, final_scanned_height) {
             let tweak_row = TweakTxRow::from_row(row);
             let row_height = tweak_row.key.blockheight;
             let is_new_block = row_height != prev_height;
@@ -419,7 +420,9 @@ impl Connection {
             }
 
             let txid = tweak_row.key.txid;
-            let tweak = tweak_row.get_tweak_data();
+            // Borrow the tweak data in place: get_tweak_data() deep-clones the
+            // whole TweakData (every vout script + spend record) once per tx.
+            let tweak = &tweak_row.value;
             let mut vout_map = HashMap::new();
 
             for vout in tweak.vout_data.iter() {

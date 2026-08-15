@@ -55,6 +55,17 @@ fn usize_from_value(val: Option<&Value>, name: &str) -> Result<usize> {
     Ok(val as usize)
 }
 
+/// Fast P2TR key extraction: OP_1 <32-byte xonly key> = 0x51 0x20 + 32 bytes.
+/// Takes raw script bytes so it works with both bitcoin::Script and
+/// elements::Script (liquid builds).
+fn p2tr_pubkey_hex(bytes: &[u8]) -> Option<String> {
+    if bytes.len() == 34 && bytes[0] == 0x51 && bytes[1] == 0x20 {
+        Some(bytes[2..].as_hex().to_string())
+    } else {
+        None
+    }
+}
+
 fn usize_from_value_or(val: Option<&Value>, name: &str, default: usize) -> Result<usize> {
     if val.is_none() {
         return Ok(default);
@@ -371,12 +382,20 @@ impl Connection {
         let mut tweak_map = HashMap::new();
         let mut prev_height = scan_height;
 
-        let rows: Vec<_> = self
-            .query
-            .tweaks_iter_scan(scan_height, final_scanned_height)
-            .collect();
+        // Per-block memoization of whether the tweak spend-cache is current for a
+        // height. Previously the cache height was read from RocksDB (creating a
+        // fresh iterator) once per TRANSACTION, which dominated scan latency.
+        // Resolving it once per block removes thousands of DB iterator creations
+        // per dense block while keeping behavior identical.
+        let mut block_cache_current: HashMap<u32, bool> = HashMap::new();
 
-        for row in rows {
+        // Stream rows straight off the (snapshot-consistent) RocksDB iterator
+        // instead of collecting the entire requested range into memory first: a
+        // dense historical request can span hundreds of thousands of rows, and
+        // collecting delays the first streamed block until the whole range has
+        // been read. Cloning the Arc keeps `self` free for send_values().
+        let query = Arc::clone(&self.query);
+        for row in query.tweaks_iter_scan(scan_height, final_scanned_height) {
             let tweak_row = TweakTxRow::from_row(row);
             let row_height = tweak_row.key.blockheight;
             let is_new_block = row_height != prev_height;
@@ -388,20 +407,26 @@ impl Connection {
                 tweak_map = HashMap::new();
             }
 
-            if row_height < last_blockchain_height - 5 {
-                let cached_height_for_tweak = self
-                    .query
-                    .chain()
-                    .get_tweak_cached_height(row_height)
-                    .unwrap_or(0);
-                query_for_height_cached = Some(last_blockchain_height == cached_height_for_tweak);
+            if row_height + 5 < last_blockchain_height {
+                query_for_height_cached = Some(
+                    *block_cache_current.entry(row_height).or_insert_with(|| {
+                        let cached_height_for_tweak = self
+                            .query
+                            .chain()
+                            .get_tweak_cached_height(row_height)
+                            .unwrap_or(0);
+                        last_blockchain_height == cached_height_for_tweak
+                    }),
+                );
             }
 
             let txid = tweak_row.key.txid;
-            let tweak = tweak_row.get_tweak_data();
+            // Borrow the tweak data in place: get_tweak_data() deep-clones the
+            // whole TweakData (every vout script + spend record) once per tx.
+            let tweak = &tweak_row.value;
             let mut vout_map = HashMap::new();
 
-            for vout in tweak.vout_data.clone().into_iter() {
+            for vout in tweak.vout_data.iter() {
                 let mut spend = vout.spending_input.clone();
                 let mut has_been_spent = spend.is_some();
 
@@ -442,13 +467,20 @@ impl Connection {
                     }
                 }
 
-                if let Some(pubkey) = &vout
-                    .script_pubkey
-                    .to_asm()
-                    .split(" ")
-                    .collect::<Vec<&str>>()
-                    .last()
-                {
+                // Fast path: P2TR scripts are OP_1 <32-byte xonly key>, so the
+                // pubkey hex is the last 32 bytes directly, avoiding the
+                // script-to-asm allocation + split done previously.
+                let pubkey_hex = p2tr_pubkey_hex(vout.script_pubkey.as_bytes()).or_else(|| {
+                    vout
+                        .script_pubkey
+                        .to_asm()
+                        .split(" ")
+                        .collect::<Vec<&str>>()
+                        .last()
+                        .map(|s| s.to_string())
+                });
+
+                if let Some(pubkey) = pubkey_hex {
                     let mut items = json!([pubkey, vout.amount]);
 
                     if historical_mode && has_been_spent {

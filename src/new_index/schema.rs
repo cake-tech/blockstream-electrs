@@ -956,9 +956,8 @@ impl ChainQuery {
     pub fn get_tweak_cached_height(&self, height: u32) -> Option<u32> {
         self.store
             .tweak_db
-            .iter_scan(&TweakBlockRecordCacheRow::key(height))
-            .map(|v| TweakBlockRecordCacheRow::from_row(v).value)
-            .next()
+            .get(&TweakBlockRecordCacheRow::key(height))
+            .and_then(|v| bincode::deserialize_big(&v).ok())
     }
 
     pub fn tweaks_iter_scan_reverse(&self, height: u32) -> ReverseScanIterator {

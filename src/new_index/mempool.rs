@@ -554,6 +554,11 @@ impl Mempool {
             mempool.write().unwrap().remove(evicted_txids);
         } // avoids acquiring a lock when there are no evictions
 
+        // Check if mempool updates are disabled
+        if mempool.read().unwrap().config.skip_mempool {
+            return Ok(true);
+        }
+
         // Find transactions available in bitcoind's mempool but not indexed locally
         let new_txids = bitcoind_txids
             .difference(&indexed_txids)

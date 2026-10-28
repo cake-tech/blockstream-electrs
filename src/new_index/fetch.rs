@@ -25,6 +25,7 @@ use crate::util::{spawn_thread, HeaderEntry, SyncChannel};
 pub enum FetchFrom {
     Bitcoind,
     BlkFiles,
+    BlkFilesReverse,
 }
 
 #[trace]
@@ -35,7 +36,8 @@ pub fn start_fetcher(
 ) -> Result<Fetcher<Vec<BlockEntry>>> {
     let fetcher = match from {
         FetchFrom::Bitcoind => bitcoind_fetcher,
-        FetchFrom::BlkFiles => blkfiles_fetcher,
+        FetchFrom::BlkFiles => blkfiles_fetcher_normal,
+        FetchFrom::BlkFilesReverse => blkfiles_fetcher_reverse,
     };
     fetcher(daemon, new_headers)
 }
@@ -123,12 +125,30 @@ fn bitcoind_fetcher(
 }
 
 #[trace]
-fn blkfiles_fetcher(
+fn blkfiles_fetcher_normal(
     daemon: &Daemon,
     new_headers: Vec<HeaderEntry>,
 ) -> Result<Fetcher<Vec<BlockEntry>>> {
+    blkfiles_fetcher(daemon, new_headers, false)
+}
+
+fn blkfiles_fetcher_reverse(
+    daemon: &Daemon,
+    new_headers: Vec<HeaderEntry>,
+) -> Result<Fetcher<Vec<BlockEntry>>> {
+    blkfiles_fetcher(daemon, new_headers, true)
+}
+
+fn blkfiles_fetcher(
+    daemon: &Daemon,
+    new_headers: Vec<HeaderEntry>,
+    reverse: bool,
+) -> Result<Fetcher<Vec<BlockEntry>>> {
     let magic = daemon.magic();
-    let blk_files = daemon.list_blk_files()?;
+    let mut blk_files = daemon.list_blk_files()?;
+    if reverse {
+        blk_files.reverse();
+    }
     let xor_key = daemon.read_blk_file_xor_key()?;
 
     let chan = SyncChannel::new(1);
@@ -168,6 +188,7 @@ fn blkfiles_fetcher(
                     .send(block_entries)
                     .expect("failed to send blocks entries from blk*.dat files");
             });
+
             if !entry_map.is_empty() {
                 panic!(
                     "failed to index {} blocks from blk*.dat files",

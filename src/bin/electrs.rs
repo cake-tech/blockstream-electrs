@@ -49,6 +49,12 @@ fn fetch_from(config: &Config, store: &Store) -> FetchFrom {
 }
 
 fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<()> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(16)
+        .thread_name(|i| format!("history-{}", i))
+        .build()
+        .unwrap();
+
     let (block_hash_notify, block_hash_receive) = channel::bounded(1);
     let signal = Waiter::start(block_hash_receive);
     let metrics = Metrics::new(config.monitoring_addr);
@@ -95,7 +101,6 @@ fn run_server(config: Arc<Config>, salt_rwlock: Arc<RwLock<String>>) -> Result<(
         &metrics,
         Arc::clone(&config),
     )));
-
     while !Mempool::update(&mempool, &daemon, &tip)? {
         // Mempool syncing was aborted because the chain tip moved;
         // Index the new block(s) and try again.

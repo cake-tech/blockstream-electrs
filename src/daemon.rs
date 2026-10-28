@@ -76,7 +76,7 @@ fn block_from_value(value: Value) -> Result<Block> {
     Ok(deserialize(&block_bytes).chain_err(|| format!("failed to parse block {}", block_hex))?)
 }
 
-fn tx_from_value(value: Value) -> Result<Transaction> {
+pub fn tx_from_value(value: Value) -> Result<Transaction> {
     let tx_hex = value.as_str().chain_err(|| "non-string tx")?;
     let tx_bytes = Vec::from_hex(tx_hex).chain_err(|| "non-hex tx")?;
     Ok(deserialize(&tx_bytes).chain_err(|| format!("failed to parse tx {}", tx_hex))?)
@@ -667,7 +667,8 @@ impl Daemon {
     pub fn gettransaction_raw(
         &self,
         txid: &Txid,
-        blockhash: &BlockHash,
+        // WARN: gettransaction_raw with blockhash=None requires bitcoind with txindex=1
+        blockhash: Option<&BlockHash>,
         verbose: bool,
     ) -> Result<Value> {
         self.request("getrawtransaction", json!([txid, verbose, blockhash]))
